@@ -63,8 +63,22 @@ export function renderSingle(r, attribution) {
     }
     out.push(`${C.dim}催化剂：${(attribution.catalysts || []).join('；') || '无可见催化剂 —— 需要耐心，价值实现路径不明'}${C.r}`);
     if (attribution.categoryUnmatched) out.push(`${C.y}⚠ 归因类别「${attribution.categoryRaw}」不在标准六类内，已原样保留${C.r}`);
+    // 分层数字 L3：模型自身知识。必须与实测结论显著分开——它没经过本系统验证。
+    if (attribution.externalNotes?.length) {
+      out.push(`\n${C.y}模型的外部知识判断（未经本系统验证，请自行核实）：${C.r}`);
+      for (const x of attribution.externalNotes) {
+        out.push(`  · ${x.claim}`);
+        if (x.why) out.push(`    ${C.dim}依据：${x.why}${C.r}`);
+      }
+    }
+    if (attribution.toolsDisabled) out.push(`${C.y}⚠ 取数工具不可用（渠道不支持），本次仅基于机械层档案${C.r}`);
     if (attribution.suspectNumbers?.length) {
       out.push(`${C.y}⚠ 以下数字无法追溯到输入数据，请自行核实：${attribution.suspectNumbers.map((x) => x.value).join('、')}${C.r}`);
+    }
+    if (attribution.toolLog?.length) {
+      const by = {};
+      for (const x of attribution.toolLog) by[x.name] = (by[x.name] || 0) + 1;
+      out.push(`${C.dim}主动取数 ${attribution.toolLog.length} 次：${Object.entries(by).map(([k, n]) => `${k}×${n}`).join('　')}${C.r}`);
     }
   } else if (attribution) {
     out.push(`\n${C.y}定性分析不可用：${attribution.reason}${C.r}`);

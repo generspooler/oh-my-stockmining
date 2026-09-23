@@ -37,6 +37,32 @@ export async function monthly(code, market, mk) {
   });
 }
 
+/**
+ * 前复权月线（SYSTEM_DEFINITION §2.6 步骤 5 顺位 2）。**仅 A股可用。**
+ *
+ * 实测：`param` 第 6 段传 qfq 时，A股 响应键从 `month` 变成 `qfqmonth`
+ * 且数值确实变了（茅台 60 月前 1830 → 1607.059，差额是累计分红）；
+ * 但**美股该参数被静默忽略**——键仍是 `month`、三种取值返回分毫不差的数据。
+ *
+ * 所以这里必须校验键名真的是 qfq 开头：拿到不复权数据却以为已复权，
+ * 正是本次要修的那类静默错误。校验失败返回 ok:false，由调用方降级。
+ */
+export async function monthlyAdjusted(code, market, mk) {
+  const tx = market === 'us' ? txUsCode(code, mk) : txCnCode(code);
+  return cached(`tx-month-qfq:${tx}`, CACHE_TTL.kline, async () => {
+    const d = await fetchJson(
+      `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${encodeURIComponent(`${tx},month,,,120,qfq`)}`,
+      { headers: H, retries: 2, timeout: 12000 },
+    ).catch(() => null);
+    const box = d?.data?.[tx] || {};
+    const key = Object.keys(box).find((k) => /^qfq/.test(k) && Array.isArray(box[k]) && box[k].length > 1);
+    if (!key) return { ok: false, reason: '该市场不提供前复权月线（响应未返回 qfq 序列）', rows: [] };
+    const rows = box[key].map((r) => ({ date: r[0], close: Number(r[2]) }))
+      .filter((x) => x.date && isFinite(x.close) && x.close > 0);
+    return { ok: rows.length > 1, reason: rows.length > 1 ? null : '前复权序列点数不足', rows };
+  });
+}
+
 /** 12 个月价格涨跌幅。序列不足则返回 null。 */
 export function yearReturn(series) {
   if (!series?.length) return null;

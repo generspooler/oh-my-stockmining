@@ -1,9 +1,15 @@
-// 定性分析层（SYSTEM_DEFINITION §3.2 第 4 层、§5.3）。
-// 两个 pass：归因（逐只）+ 裁决排序（单次处理全部候选）。
-// 模型不得输出任何未经代码计算的数字——输出侧做 schema + 数字白名单双重校验。
-import { complete, extractJson, validateNumbers, llmReady } from './llm.js';
-import { NARRATIVE, SCREENING } from './config.js';
-import { pool } from './util.js';
+// 定性分析层（单股路径，SYSTEM_DEFINITION §3.4、§5.3）。
+//
+// v0.7.1：只剩归因这一个 pass。原先的 verdictPass / runAttributions 已删除——
+// 零调用的死代码，且 verdictPass 引用了不存在的 SCREENING.layer4model.topN（调用即抛），
+// 其提示词还带着已被 §3.2 废止的「单一行业不得超过 2 只」。
+// 市场裁决在 src/verdict.js，自选裁决在 src/review.js。
+//
+// 数字规则改为**分层**（§5.3）：给定数据与工具返回同权可引用，
+// 模型自身知识只能进 externalNotes 并标注「未经本系统验证」。
+import { complete, completeWithTools, extractJson, validateNumbers, whitelistOf, llmReady } from './llm.js';
+import { buildTools, withTranscript } from './tools.js';
+import { NARRATIVE } from './config.js';
 
 const ATTR_CATEGORIES = ['周期性底部', '一次性事件冲击', '流动性情绪杀', '治理折价', '结构性衰退', '商业模式证伪'];
 const TRAPS = ['结构性衰退', '商业模式证伪'];
@@ -38,6 +44,15 @@ const SYS_ATTRIBUTION = `你是遵循价值投资原则的资深证券分析师�
 
 【必须产出否决条件】写明「若 X 发生则本结论作废」。无法证伪的看多理由不予采纳。
 
+【关于数字与你自己的知识】分三层，别混：
+1. **上面给定的数据**与**你用工具取回的数据**——同等可信，可直接引用。
+2. **你自己的记忆与判断**——可以用，而且在给定数据看起来不对时（口径可疑、
+   数量级离谱、与你所知的事实冲突）**应该**用。但必须写进 externalNotes，并说明依据。
+   系统会把它标注为「外部知识，未经本系统验证」呈现给用户。
+3. **不要**把记忆里的数字直接写进 summary / evidence 冒充实测值。
+
+**发现给定数据有问题时请明说，不要将就着用。**
+
 输出 JSON：
 {
   "category": "上表六类之一",
@@ -47,43 +62,19 @@ const SYS_ATTRIBUTION = `你是遵循价值投资原则的资深证券分析师�
   "killCriteria": ["若X发生则结论作废", "..."],
   "risks": ["关键风险，3-5 条"],
   "catalysts": ["价值实现的可见催化剂；确实没有则输出空数组"],
+  "externalNotes": [{ "claim": "基于自身知识的判断或对给定数据的质疑", "why": "依据" }],
   "summary": "两到三句话说明为什么便宜，以及这个便宜是否值得买"
 }`;
 
-const SYS_VERDICT = `你是资深投资组合分析师，负责从候选清单中选出最值得投资的标的。
+const TOOL_GUIDE = `【你可以主动取数】
+上面的已知数据是机械层算出来的**摘要**，它答不了「这个便宜是错杀还是陷阱」——
+那需要行业格局、经营解释、管理层自述。所以给了你工具。
 
-下方候选数据为最新实测值，请以此为准。
+最有价值的是 get_filing：能取到年报/半年报（美股 10-K）里管理层自己写的
+行业判断、经营解释与风险披露。判断错杀与陷阱时它通常比任何财务比率都管用。
 
-【排序依据】背离分 40% + 安全边际 30% + 质量分 20% + 催化剂强度 10%。
-【硬约束】最终名单中单一行业不得超过 2 只，超出者顺延。
-【剔除】已标记 isTrap 的标的不得入选。
-
-只输出 JSON：
-{
-  "ranked": [
-    { "code": "代码", "rank": 1, "reason": "入选理由，两句话", "catalystStrength": "强|中|弱|无" }
-  ],
-  "excluded": [ { "code": "代码", "why": "未入选原因" } ],
-  "note": "对本轮候选整体质量的一句话判断"
-}`;
-
-/**
- * 白名单 = 提示词里出现过的**全部**数字。
- *
- * 这才是铁律 3 的正确语义：「模型只能使用我们给它的数字」。
- * 早期版本只把 result.numbers 当白名单，但提示词里的「多视角判定」段落还含有
- * 行业中位 PE、合理 PB、FCF 收益率等派生数字——模型忠实引用了它们，却被判成幻觉，
- * 导致每次归因都白跑 3 次重试后放弃（实测茅台连续三轮全部误杀）。
- */
-export function whitelistFromPrompt(prompt, base = {}) {
-  const wl = { ...base };
-  let i = 0;
-  for (const m of String(prompt).matchAll(/-?\d+(?:\.\d+)?/g)) {
-    const v = Number(m[0]);
-    if (isFinite(v)) wl[`_p${i++}`] = v;
-  }
-  return wl;
-}
+这是**单只标的的深度分析**，预算相对宽松——该取的数据不要省。
+预算接近用尽时系统会如实告知你。`;
 
 /** 把机械层算好的数字渲染成提示词里的「已知数据」块。 */
 function renderNumbers(result) {
@@ -94,7 +85,9 @@ function renderNumbers(result) {
     `档位判定：${result.tier.name}${result.tierCapped ? '（因多视角未达成一致被压制）' : ''}`,
     `置信度：${result.confidence.level}（${result.confidence.score} 分）`,
     '',
-    '【已知数据】以下是全部可用数字，不得使用此外的任何数值：',
+    // 措辞随分层规则一起改：旧文案「不得使用此外的任何数值」与
+    // 「发现数据有问题请明说」自相矛盾，模型会不敢质疑。
+    '【已知数据】机械层实测值。定量结论请用这些数字（或你用工具取回的数字）：',
   ];
   for (const [k, v] of Object.entries(result.numbers)) lines.push(`  ${k} = ${v}`);
   if (result.routeAmbiguous && result.altBand?.ok) {
@@ -118,18 +111,32 @@ function renderNumbers(result) {
 /**
  * pass 1 · 归因（逐只）。schema + 数字白名单校验失败则重试，仍失败标记不可用。
  */
-export async function attributionPass(result, { onEvent } = {}) {
+export async function attributionPass(result, { onEvent, useTools = true } = {}) {
   if (!llmReady()) return { ok: false, reason: '缺少模型凭据' };
   const prompt = renderNumbers(result);
   const rejects = [];   // 记录每次被拒的原因与原始输出，便于诊断（§5.3 不静默放行也不静默丢弃）
+  // 单股的取数工具。byCode 只放这一只——模型不能把分析扩散到没收集过的标的。
+  const row = { ...(result.stock || {}), price: result.price ?? result.stock?.price };
+  const kit = useTools && row.code ? buildTools({ rows: [row] }) : null;
+  const b = NARRATIVE.tools.budgets.single;
+  const system = SYS_ATTRIBUTION + (kit ? `\n\n${TOOL_GUIDE}` : '');
   for (let attempt = 0; attempt <= NARRATIVE.schemaRetries; attempt++) {
     try {
-      const r = await complete({
-        system: SYS_ATTRIBUTION,
-        messages: [{ role: 'user', content: prompt + (attempt ? '\n\n上次输出不合规，请严格只输出 JSON，且不得出现已知数据之外的数字。' : '') }],
-        maxTokens: NARRATIVE.maxTokens,
-        onFallback: (f, t, why) => onEvent?.({ type: 'fallback', from: f, to: t, why }),
-      });
+      const tr = kit ? withTranscript(kit.handle) : null;
+      const msgs = [{ role: 'user', content: prompt + (attempt ? '\n\n上次输出不合规，请严格只输出 JSON。' : '') }];
+      const r = kit
+        ? await completeWithTools({
+          system, messages: msgs, tools: kit.defs, onToolCall: tr.handle,
+          softToolCalls: b.soft, maxToolCalls: b.hard,
+          maxTokens: NARRATIVE.maxTokens,
+          onFallback: (f, t, why) => onEvent?.({ type: 'fallback', from: f, to: t, why }),
+          onToolEvent: (e) => onEvent?.(e),
+        })
+        : await complete({
+          system, messages: msgs,
+          maxTokens: NARRATIVE.maxTokens,
+          onFallback: (f, t, why) => onEvent?.({ type: 'fallback', from: f, to: t, why }),
+        });
       const json = extractJson(r.text);
       // 只有「压根解析不出结构」才值得重试；其余一律接受后标注
       if (!json) { rejects.push({ why: 'JSON 解析失败', raw: r.text.slice(0, 400) }); continue; }
@@ -137,8 +144,9 @@ export async function attributionPass(result, { onEvent } = {}) {
       // 数字白名单：只校验自由文本部分
       // 数字校验只标注、不丢弃：误报一次的代价是 3 次调用 + 130s，
       // 而实际风险（如把 76139300000 写成 761393000000 的单位滑位）标注出来就足够读者识别。
+      // 分层数字：L1 提示词 + L2 工具返回同为白名单；L3（externalNotes）不参与校验
       const freeText = [json.summary, ...(json.evidence || []), ...(json.risks || []), ...(json.killCriteria || [])].join(' ');
-      const v = validateNumbers(freeText, whitelistFromPrompt(prompt, result.numbers));
+      const v = validateNumbers(freeText, whitelistOf(prompt + (tr ? '\n' + tr.text() : '')));
       if (!v.ok) onEvent?.({ type: 'suspect', values: v.violations.map((x) => x.value), attempt });
       return {
         ok: true, model: r.model, ...json,
@@ -146,7 +154,12 @@ export async function attributionPass(result, { onEvent } = {}) {
         categoryRaw: json.category,
         categoryUnmatched: !category,
         isTrap: json.isTrap ?? (category ? TRAPS.includes(category) : false),
+        externalNotes: (json.externalNotes || [])
+          .filter((x) => String(x?.claim || '').trim())
+          .map((x) => ({ claim: String(x.claim).trim(), why: String(x.why || '').trim() || null })),
         suspectNumbers: v.violations,
+        toolLog: r.toolLog || [], toolCalls: r.toolCalls || 0,
+        toolsDisabled: r.toolsDisabled || undefined,
       };
     } catch (e) {
       onEvent?.({ type: 'error', message: e.message, attempt });
@@ -154,60 +167,6 @@ export async function attributionPass(result, { onEvent } = {}) {
     }
   }
   return { ok: false, reason: 'schema 或数字校验连续失败，标记定性分析不可用', rejects };
-}
-
-/**
- * pass 2 · 裁决排序（单次，处理全部候选）。
- * 排序是横截面判断——必须同时看到全部候选才排得出序，故不逐只调用。
- */
-export async function verdictPass(candidates, { topN = SCREENING.layer4model.topN, onEvent } = {}) {
-  if (!llmReady()) return { ok: false, reason: '缺少模型凭据' };
-  const alive = candidates.filter((c) => !c.attribution?.isTrap);
-  if (!alive.length) return { ok: true, ranked: [], excluded: candidates.map((c) => ({ code: c.stock.code, why: '归因判为陷阱' })), note: '全部候选被判为价值陷阱' };
-
-  const block = alive.map((c, i) => {
-    const n = c.numbers;
-    return [
-      `${i + 1}. ${c.stock.name}（${c.stock.code}）行业：${c.stock.industry}`,
-      `   档位 ${c.tier.name} | P/V ${n.PV比值 ?? '—'} | 实际安全边际 ${n.实际安全边际 ?? '—'} | 要求 ${n.要求安全边际 ?? '—'}`,
-      `   背离分 ${c.divergence?.score ?? '—'} | F分数 ${n.F分数 ?? '—'} | 置信度 ${n.置信度分数 ?? '—'}`,
-      `   归因：${c.attribution?.category ?? '未知'} —— ${c.attribution?.summary ?? ''}`,
-      `   催化剂：${(c.attribution?.catalysts || []).join('；') || '无可见催化剂'}`,
-    ].join('\n');
-  }).join('\n\n');
-
-  const allNumbers = Object.assign({}, ...alive.map((c) => c.numbers));
-  for (let attempt = 0; attempt <= NARRATIVE.schemaRetries; attempt++) {
-    try {
-      const r = await complete({
-        system: SYS_VERDICT,
-        messages: [{ role: 'user', content: `候选共 ${alive.length} 只，请选出最值得投资的 ${topN} 只并排序。\n\n${block}` }],
-        maxTokens: NARRATIVE.maxTokens,
-        onFallback: (f, t, why) => onEvent?.({ type: 'fallback', from: f, to: t, why }),
-      });
-      const json = extractJson(r.text);
-      if (!json?.ranked?.length) continue;
-      const known = new Set(alive.map((c) => c.stock.code));
-      json.ranked = json.ranked.filter((x) => known.has(x.code)).slice(0, topN);
-      if (!json.ranked.length) continue;
-      const v = validateNumbers(json.ranked.map((x) => x.reason).join(' ') + ' ' + (json.note || ''),
-        whitelistFromPrompt(block, allNumbers));
-      if (!v.ok) onEvent?.({ type: 'suspect', values: v.violations.map((x) => x.value), attempt });
-      return { ok: true, model: r.model, ...json, suspectNumbers: v.violations };
-    } catch (e) {
-      onEvent?.({ type: 'error', message: e.message, attempt });
-      if (attempt === NARRATIVE.schemaRetries) return { ok: false, reason: e.message };
-    }
-  }
-  return { ok: false, reason: 'schema 或数字校验连续失败' };
-}
-
-/** 批量跑归因 pass，受并发限制。 */
-export async function runAttributions(results, { onProgress, onEvent } = {}) {
-  return pool(results, NARRATIVE.concurrency, async (r) => {
-    const a = await attributionPass(r, { onEvent });
-    return { ...r, attribution: a };
-  }, onProgress);
 }
 
 export { renderNumbers };

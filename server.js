@@ -25,14 +25,44 @@ const bodyOf = (req) => new Promise((resolve) => {
   req.on('end', () => resolve(b));
 });
 
+/**
+ * 档案瘦身后推给前端。整份 profile 带逐日估值序列与全文新闻（单只可达上百 KB），
+ * 前端只用得到这几个字段；两个挖掘端点共用同一份裁剪口径。
+ */
+const slimProfiles = (profiles) => (profiles || []).map((p) => ({
+  code: p.code, name: p.name, industry: p.industry, price: p.price, market: p.market,
+  pe: p.pe, pb: p.pb, fScore: p.fScore, roe: p.roe, roeMedian5: p.roeMedian5,
+  drawdowns: p.drawdowns, priceSeries: p.priceSeries || null,   // 回撤口径（§2.6）须随数据一起到前端
+  band: p.band?.ok ? p.band : null, tier: p.band?.tier || null,
+  coarseGuess: p.coarseGuess, coarseWhy: p.coarseWhy,
+  isWatch: !!p.isWatch, outOfPool: !!p.outOfPool,
+  newsCount: p.news?.news?.length || 0,
+}));
+
+/**
+ * SSE 通道。
+ * 必须容忍客户端中途断开：一轮挖掘十几分钟，用户关标签页是常态，
+ * 而向已销毁的响应流 write 会触发 'error' 事件——没有监听者就是未捕获异常，
+ * 整个服务会被一次关页面带走（连带丢掉还没落盘的结果）。
+ * 断开后静默丢弃后续事件，流水线照常跑完并落盘。
+ */
 function sse(res) {
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
     'cache-control': 'no-cache', connection: 'keep-alive',
   });
+  let alive = true;
+  const die = () => { alive = false; };
+  res.on('error', die);
+  res.on('close', die);
   return {
-    send: (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`),
-    end: () => res.end(),
+    get alive() { return alive; },
+    send: (event, data) => {
+      if (!alive) return false;
+      try { return res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); }
+      catch { alive = false; return false; }
+    },
+    end: () => { try { res.end(); } catch {} },
   };
 }
 
@@ -119,6 +149,9 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── 市场挖掘（四阶段）──────────────────────────────────
+  // v0.6：纯市场，不再注入自选票、不再有分组配额。自选票若本身在池内，
+  // 作为普通市场候选参与粗筛竞争；榜上的「已自选」标记由前端按自选池比对。
   if (p === '/api/mine') {
     const market = url.searchParams.get('market') === 'us' ? 'us' : 'cn';
     const ch = sse(res);
@@ -130,33 +163,21 @@ const server = http.createServer(async (req, res) => {
       const { finalVerdict } = await import('./src/verdict.js');
       const { llmReady } = await import('./src/llm.js');
       const { saveMine, buildMinePayload } = await import('./src/history.js');
-      const { watchlistFor } = await import('./src/watchlist.js');
       const tStart = Date.now();
-
-      // 自选池：池内票绕过池子过滤并入阶段1（§3.2），跳过粗筛直通阶段3
-      const watchItems = watchlistFor(market);
 
       // stage 事件带结构化 phase/done/total，前端据此驱动进度条，
       // 不必解析「阶段N · 」这种脆弱的字符串前缀。
       const stage = (phase, text, done, total) => ch.send('stage', { phase, text, done, total });
       stage(1, '全市场信息收集');
-      const { rows, meta } = await collect(market, { onProgress: (t) => stage(1, t), includeCodes: watchItems.map((x) => x.code) });
-      const joined = new Set((meta.watch?.codes || []).map(String));
-      const watchRows = rows.filter((r) => r.isWatch);
-      const watchMissing = watchItems.filter((x) => !joined.has(String(x.code))).map((x) => `${x.name}(${x.code})`);
-      ch.send('collected', {
-        meta,
-        watch: watchItems.length ? { pool: watchItems.length, joined: watchRows.length, missing: watchMissing } : null,
-      });
+      const { rows, meta } = await collect(market, { onProgress: (t) => stage(1, t) });
+      ch.send('collected', { meta, watch: null });
 
       if (!llmReady()) {
         ch.send('error', { message: '未检测到模型凭据：机械层已完成收集，模型推理不可用。请 export ANTHROPIC_AUTH_TOKEN 后重启服务。' });
         return ch.end();
       }
 
-      // 粗筛只看市场候选——自选票免检直通深度补数，名额完整留给市场
-      const marketRows = rows.filter((r) => !r.isWatch);
-      const coarse = await coarseScreen(marketRows, market, {
+      const coarse = await coarseScreen(rows, market, {
         caveats: meta.caveats,
         onProgress: (d, t, b) => stage(2, `粗筛（${b}）`, d, t),
       });
@@ -164,35 +185,47 @@ const server = http.createServer(async (req, res) => {
         calls: coarse.calls, picks: coarse.picks.length,
         batches: coarse.results.map((r) => ({ label: r.label || r.bucket, scanned: r.scanned || 0, picked: (r.picks || []).length, note: r.note, ok: r.ok, reason: r.reason })),
       });
-      if (!coarse.picks.length && !watchRows.length) { ch.send('done', { ok: true }); return ch.end(); }
+      if (!coarse.picks.length) { ch.send('done', { ok: true }); return ch.end(); }
 
-      const watchPicks = watchRows.map((r) => ({ row: r, why: null, guess: null, checkNext: null }));
-      const profiles = await deepen([...coarse.picks, ...watchPicks], {
+      const profiles = await deepen(coarse.picks, {
         onProgress: (t) => {
           const m = String(t).match(/(\d+)\/(\d+)/);
           stage(3, t.replace(/\s*\d+\/\d+$/, ''), m ? Number(m[1]) : undefined, m ? Number(m[2]) : undefined);
         },
       });
-      const okCodes = new Set(profiles.map((p) => String(p.code).toUpperCase()));
-      const watchFailed = watchRows.filter((r) => !okCodes.has(String(r.code).toUpperCase())).map((r) => `${r.name}(${r.code})`);
       stage(4, '总裁决');
       const v = await finalVerdict(profiles);
       // 落盘：此前只有 CLI 写快照，网页跑的结果全部丢失
       try {
         saveMine(buildMinePayload({
-          market, meta, coarse, profiles, verdict: v,
-          watch: watchItems.length ? { pool: watchItems.length, joined: watchRows.length, missing: watchMissing, failed: watchFailed } : null,
+          scope: 'market', market, meta, coarse, profiles, verdict: v,
           totalMs: Date.now() - tStart, modelCalls: coarse.calls + 1,
         }));
       } catch {}
-      ch.send('verdict', { verdict: v, watch: watchItems.length ? { failed: watchFailed } : null, profiles: profiles.map((p) => ({
-        code: p.code, name: p.name, industry: p.industry, price: p.price, market: p.market,
-        pe: p.pe, pb: p.pb, fScore: p.fScore, roe: p.roe, roeMedian5: p.roeMedian5,
-        drawdowns: p.drawdowns, band: p.band?.ok ? p.band : null, tier: p.band?.tier || null,
-        coarseGuess: p.coarseGuess, coarseWhy: p.coarseWhy,
-        isWatch: !!p.isWatch,
-        newsCount: p.news?.news?.length || 0,
-      })) });
+      ch.send('verdict', { scope: 'market', verdict: v, profiles: slimProfiles(profiles) });
+      ch.send('done', { ok: true });
+    } catch (e) {
+      ch.send('error', { message: e.message });
+    } finally { inFlight--; ch.end(); }
+    return;
+  }
+
+  // ── 自选池挖掘（三阶段：收集 → 补数 → 裁决）─────────────
+  // 与市场挖掘完全独立：不粗筛、不混排、不共用名额，只有 1 次模型调用。
+  if (p === '/api/mine/watch') {
+    const market = url.searchParams.get('market') === 'us' ? 'us' : 'cn';
+    const ch = sse(res);
+    inFlight++;
+    try {
+      const { runWatchMine } = await import('./src/watchRun.js');
+      const r = await runWatchMine(market, {
+        onStage: (phase, text, done, total) => ch.send('stage', { phase, text, done, total }),
+        onCollected: (d) => ch.send('collected', d),
+      });
+      ch.send('verdict', {
+        scope: 'watch', market, verdict: r.verdict,
+        watch: r.watch, profiles: slimProfiles(r.profiles),
+      });
       ch.send('done', { ok: true });
     } catch (e) {
       ch.send('error', { message: e.message });

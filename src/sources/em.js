@@ -110,13 +110,23 @@ export async function universe(market, { includeBeijing = false } = {}) {
 }
 
 /**
- * 日K线。fqt: 0=不复权（估值反算必须用），1=前复权（收益率计算用）。
- * 返回 [{date, close, turnover}]。
+ * K线。klt: 101=日 / 103=月。fqt: 0=不复权 / 1=前复权 / 2=后复权。
+ *
+ * 复权口径的选择见 SYSTEM_DEFINITION §2.6 步骤 1，三条都是实测结论：
+ *   - 估值反算必须 fqt=0——复权价 × 股数 不等于当时市值；
+ *   - 收益率/回撤必须复权，否则拆股与分红被读成下跌（NVDA 三年 −47% vs 真实 +364%）；
+ *   - 且必须用**后复权 fqt=2，不能用前复权 fqt=1**。前复权从最新价往前扣现金分红，
+ *     长窗口叠加拆股会扣穿零：实测 NVDA 日K 222 个非正收盘、茅台 369 个、KLAC 9 个，
+ *     后复权在同样样本上非正点为 0。回撤只取比值，后复权不影响结果且数值稳定。
+ *
+ * 缓存键带 v2 与 klt：键结构变过就必须换键，否则旧条目会在整个 TTL 内冒充新口径
+ * （本文件 UNIVERSE_VERSION / MAP_VERSION 两处都是为同一个教训留下的）。
+ * 返回 [{date, close, turnover}]，旧→新。
  */
-export async function kline(secid, { fqt = 1, beg = '20180101', end = '20500101' } = {}) {
-  return cached(`kline:${secid}:${fqt}:${beg}`, CACHE_TTL.kline, async () => {
+export async function kline(secid, { klt = 101, fqt = 1, beg = '20180101', end = '20500101' } = {}) {
+  return cached(`kline:v2:${secid}:${klt}:${fqt}:${beg}`, CACHE_TTL.kline, async () => {
     const d = await push(`/api/qt/stock/kline/get?${qs({
-      secid, klt: 101, fqt, beg, end, fields1: 'f1,f2,f3', fields2: 'f51,f53,f57',
+      secid, klt, fqt, beg, end, fields1: 'f1,f2,f3', fields2: 'f51,f53,f57',
     })}`, 'push2his.eastmoney.com').catch(() => null);
     return (d?.data?.klines || []).map((line) => {
       const [date, close, turnover] = line.split(',');

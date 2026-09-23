@@ -77,15 +77,22 @@ test('sectorBucket 保持纯行业口径，不被股息维度污染', () => {
   assert.equal(sectorBucket('信息技术', 'us'), '科技');
 });
 
-test('名额配置：两市场各 30（v0.5 自选组占一半后同比例缩减），目标批恰为 50%', () => {
+test('名额配置：两市场各 50（v0.6 市场榜独占 10 席后回到 5:1 密度），目标批恰为 50%', () => {
   const sum = (o) => Object.values(o).reduce((a, b) => a + b, 0);
   const { cn: c, us: u } = SCREENING.batchPicks;
-  assert.equal(sum(c), 30);
-  assert.equal(sum(u), 30);
+  assert.equal(sum(c), 50);
+  assert.equal(sum(u), 50);
   assert.equal(c[DIVIDEND_BUCKET] / sum(c), 0.5, 'A股中高股息占 50%');
   assert.equal(u['科技'] / sum(u), 0.5, '美股科技占 50%');
-  // 自选组配额 = ⌊topN/2⌋，与文档 §3.2 一致
-  assert.equal(SCREENING.watch.topN, Math.floor(SCREENING.topN / 2));
+  // 粗筛名额必须够市场榜挑：低于 5:1 就等于让裁决在过窄的候选里硬选
+  assert.ok(sum(c) / SCREENING.topN >= 5, 'A股粗筛密度 ≥ 5:1');
+  assert.ok(sum(u) / SCREENING.topN >= 5, '美股粗筛密度 ≥ 5:1');
+});
+
+test('自选榜名额与市场榜彻底独立（v0.6 分开挖掘，不再是 topN 的一半）', () => {
+  // 破掉这条说明两张榜又被耦合回去了——那正是 v0.6 要拆掉的东西
+  assert.ok(SCREENING.watch.topN > 0);
+  assert.equal(SCREENING.watch.topN, 8);
 });
 
 test('每个批次名都有对应名额，不会静默落到 defaultPicks', () => {

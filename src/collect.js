@@ -11,8 +11,8 @@ import * as sec from './sources/sec.js';
 import * as tx from './sources/tencent.js';
 import { fScore } from './metrics/scores.js';
 import { US_EXCLUDED_SECTORS, sectorBucket } from './classify.js';
-import { median, safeDiv, daysBetween } from './util.js';
-import { SCREENING } from './config.js';
+import { median, safeDiv, daysBetween, pool as runPool } from './util.js';
+import { SCREENING, LIMITS } from './config.js';
 
 const pctOf = (v) => (v == null ? null : v / 100);
 const cagr = (newest, oldest, years) =>
@@ -63,17 +63,33 @@ function aggregates(annuals) {
   };
 }
 
-/** A股：MAINFINADATA 按报告期整市场查，6 期拼成每只的年报序列。 */
-async function collectCN(pool, onProgress) {
+/**
+ * A股：MAINFINADATA 按报告期整市场查，6 期拼成每只的年报序列。
+ *
+ * perStock：自选池挖掘的路径。池子只有十来只时，为它们拉 6 次整市场分页
+ * （每次约 28 页）纯属浪费——改成逐股查（每只 1 次请求，缓存 7 天），
+ * 自选池挖掘的耗时因此与全市场脱钩。两条路共用 mapMain，行结构完全一致。
+ */
+async function collectCN(pool, onProgress, { perStock = false } = {}) {
   const periods = em.recentAnnualPeriods(6);
   const byCode = new Map();
-  for (let i = 0; i < periods.length; i++) {
-    const rows = await em.marketIndicators(periods[i]);
-    for (const r of rows) {
-      if (!byCode.has(r.code)) byCode.set(r.code, []);
-      byCode.get(r.code).push(r);
+  if (perStock) {
+    let done = 0;
+    await runPool(pool, LIMITS.emConcurrency, async (s) => {
+      const rows = await em.mainIndicators(s.code).catch(() => []);
+      // 逐股接口返回季报+年报混排，这里只取年报期，与整市场路径口径一致
+      byCode.set(s.code, rows.filter((r) => String(r.period || '').endsWith('-12-31')).slice(0, periods.length));
+      onProgress?.(`财务指标 ${++done}/${pool.length} 只`);
+    });
+  } else {
+    for (let i = 0; i < periods.length; i++) {
+      const rows = await em.marketIndicators(periods[i]);
+      for (const r of rows) {
+        if (!byCode.has(r.code)) byCode.set(r.code, []);
+        byCode.get(r.code).push(r);
+      }
+      onProgress?.(`财务指标 ${i + 1}/${periods.length} 期`);
     }
-    onProgress?.(`财务指标 ${i + 1}/${periods.length} 期`);
   }
   return pool.map((s) => {
     const annuals = (byCode.get(s.code) || []).sort((a, b) => (a.period < b.period ? 1 : -1));
@@ -145,25 +161,26 @@ async function collectUS(pool, onProgress) {
  * 全市场收集。返回 { rows, meta }。
  * rows 每行含：行情与跌幅、当期基本面、多年聚合（F-Score/ROE中位/CAGR/累计FCF）。
  *
- * includeCodes：自选池代码（§3.2）。这些标的绕过 inPool 池子过滤照常收集
- * ——用户点名要看的票不因 ST/流动性/行业排除而丢字段；行上打 isWatch 标记，
- * meta.watch.codes 记录实际并入的代码（未找到的由调用方对照自选清单报出）。
+ * onlyCodes：**自选池挖掘**专用（§3.3）。给定时池子就是点名的这几只，
+ * 不跑 inPool 闸门——用户点名要看的票不因 ST/流动性/行业排除而消失；
+ * 落在排除项内的打 outOfPool，渲染与提示词都要显著标注口径适配有限（§2.1）。
+ * 不给时是市场挖掘：池子 = inPool 全市场，**不注入任何自选票**
+ * （v0.6 两条流水线彻底分开，自选票只作为普通市场票参与粗筛竞争）。
  */
-export async function collect(market, { onProgress, includeCodes = [] } = {}) {
+export async function collect(market, { onProgress, onlyCodes = null } = {}) {
   const t0 = Date.now();
+  const only = onlyCodes ? new Set(onlyCodes.map((c) => String(c).toUpperCase())) : null;
+  const isOnly = (s) => !!only?.has(String(s.code || '').toUpperCase());
   onProgress?.('拉取全市场列表');
   const universe = await em.universe(market);
-  const watch = new Set((includeCodes || []).map((c) => String(c).toUpperCase()));
-  const inWatch = (s) => watch.has(String(s.code || '').toUpperCase());
-  const pool = universe.filter((s) => inPool(s, market) || inWatch(s));
+  const pool = only ? universe.filter(isOnly) : universe.filter((s) => inPool(s, market));
 
   onProgress?.('批量行情与 52 周高低');
   const quotes = await tx.batchQuotes(pool.map((s) => s.code), market);
 
-  onProgress?.(market === 'cn' ? '财务指标（整市场按期）' : 'SEC frames 批量基本面');
+  onProgress?.(only ? '财务指标（逐股）' : market === 'cn' ? '财务指标（整市场按期）' : 'SEC frames 批量基本面');
   const base = pool.map((s) => {
     const q = quotes.get(s.code) || {};
-    const w = inWatch(s);
     return {
       code: s.code, name: s.name, market, mk: s.mk, secid: s.secid,
       industry: s.industry, sector: sectorBucket(s.industry, market),
@@ -175,13 +192,15 @@ export async function collect(market, { onProgress, includeCodes = [] } = {}) {
       roe: s.roe ?? null,
       dividendYield: s.dividendYield ?? null,   // 百分数原值；A股据此分流出「中高股息」批
       // undefined 键在 JSON 序列化时自然消失：市场候选不带这两个字段，快照保持干净
-      isWatch: w || undefined,
+      isWatch: only ? true : undefined,
       // 自选票若不满足池子限定（ST/流动性/美股金融等），渲染时须显著标注口径适配有限（§2.1）
-      outOfPool: (w && !inPool(s, market)) || undefined,
+      outOfPool: (only && !inPool(s, market)) || undefined,
     };
   });
 
-  const rows = market === 'cn' ? await collectCN(base, onProgress) : await collectUS(base, onProgress);
+  const rows = market === 'cn'
+    ? await collectCN(base, onProgress, { perStock: !!only })
+    : await collectUS(base, onProgress);
   // 字段可得性说明：随数据一起交给模型，让它知道空值是「数据源没有」
   // 而不是「公司没披露」——两者含义完全不同，会影响判断。
   const caveats = market === 'us' ? [
@@ -196,9 +215,9 @@ export async function collect(market, { onProgress, includeCodes = [] } = {}) {
   return {
     rows,
     meta: {
-      market, universe: universe.length, pool: pool.length,
-      // 自选池并入情况：codes 是在 universe 里找到并已收集的自选代码
-      watch: { requested: includeCodes.length, codes: pool.filter(inWatch).map((s) => s.code) },
+      market, universe: universe.length, pool: pool.length, scope: only ? 'watch' : 'market',
+      // 自选池挖掘：codes 是在 universe 里找到并已收集的自选代码（未找到的由调用方报出）
+      watch: only ? { requested: only.size, codes: pool.map((s) => s.code) } : undefined,
       quoted: quotes.size, elapsedMs: Date.now() - t0,
       collectedAt: new Date().toISOString(),
       caveats,

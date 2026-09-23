@@ -46,6 +46,10 @@ h1{font-size:20px;font-weight:600;margin:0 0 4px;letter-spacing:.02em}
 .wx{cursor:pointer;color:var(--dim);flex:0 0 auto;padding:0 3px;font-size:12px}
 .wx:hover{color:var(--r)}
 .whint{padding:6px 16px;font-size:12px;color:var(--y)}
+.wact{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:10px 16px 12px;
+  border-top:1px dashed var(--line)}
+.wact button{padding:7px 12px;font-size:13px}
+.wact .dim{font-size:12px}
 .grp{display:inline-block;padding:1px 8px;border-radius:99px;font-size:11px;font-weight:600}
 .grpW{background:color-mix(in srgb,var(--acc) 20%,transparent);color:var(--acc)}
 .grpM{background:color-mix(in srgb,var(--dim) 16%,transparent);color:var(--dim)}
@@ -162,8 +166,8 @@ details.cb>summary:hover{color:var(--acc)}
     <div class="suggest" id="suggest"></div>
   </div>
   <button class="p" id="bAnalyze" onclick="analyze()">分析</button>
-  <button id="bCn" onclick="mine('cn')">挖掘 A股</button>
-  <button id="bUs" onclick="mine('us')">挖掘 美股</button>
+  <button id="bCn" onclick="mine('cn')">挖掘 A股市场</button>
+  <button id="bUs" onclick="mine('us')">挖掘 美股市场</button>
 </div>
 
 <details class="hist" id="watch">
@@ -174,6 +178,11 @@ details.cb>summary:hover{color:var(--acc)}
   </div>
   <div class="wmsg" id="wmsg"></div>
   <div class="tl" id="wl"></div>
+  <div class="wact">
+    <button id="bwCn" onclick="mineWatch('cn')">挖掘 A股自选</button>
+    <button id="bwUs" onclick="mineWatch('us')">挖掘 美股自选</button>
+    <span class="dim">不粗筛 · 1 次模型调用 · 与市场挖掘各跑各的</span>
+  </div>
 </details>
 
 <details class="hist" id="hist">
@@ -198,8 +207,11 @@ const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&g
 const n=(v,d=2)=>v==null||!isFinite(v)?'—':Number(v).toFixed(d);
 const pct=(v,d=0)=>v==null||!isFinite(v)?'—':(v*100).toFixed(d)+'%';
 
-// ── 四阶段进度条 ───────────────────────────────────────
-const PHASES=['收集','粗筛','补数','裁决'];
+// ── 进度条 ─────────────────────────────────────────────
+// 市场挖掘四阶段，自选池挖掘三阶段（不粗筛）——阶段名由发起方传入。
+const PHASES_MARKET=['收集','粗筛','补数','裁决'];
+const PHASES_WATCH=['收集','补数','裁决'];
+let PHASES=PHASES_MARKET;
 let timer=null, t0=0, cur={phase:0,text:'',done:null,total:null};
 
 function drawSteps(){
@@ -212,7 +224,8 @@ function drawSteps(){
       <div class="nm">${nm}</div><div class="sub2">${sub}</div></div>`;
   }).join('');
 }
-function startProg(){
+function startProg(phases){
+  PHASES=phases||PHASES_MARKET;
   cur={phase:0,text:'',done:null,total:null};
   t0=Date.now(); $('#prog').classList.add('on'); drawSteps();
   clearInterval(timer);
@@ -231,20 +244,33 @@ function endProg(ok){
   clearInterval(timer); timer=null;
   if(ok){ cur.phase=PHASES.length+1; drawSteps(); $('#pnow').textContent='完成'; }
 }
-function busy(b){ ['bAnalyze','bCn','bUs'].forEach(id=>$('#'+id).disabled=b); }
+let BUSY=false;
+function busy(b){
+  BUSY=b;
+  ['bAnalyze','bCn','bUs','bwAdd'].forEach(id=>$('#'+id).disabled=b);
+  syncWatchBtns();   // 自选按钮还受「该市场池子非空」约束，不能只看忙态
+}
+function syncWatchBtns(){
+  const cn=WATCH.filter(x=>x.market==='cn').length;
+  const set=(id,n,label)=>{const b=$('#'+id); if(!b)return;
+    b.textContent=`挖掘 ${label}自选${n?`（${n}）`:''}`;
+    b.disabled=BUSY||!n;
+    b.title=n?`只跑池内这 ${n} 只：收集 → 补数 → 裁决`:`${label}自选池为空`;};
+  set('bwCn',cn,'A股'); set('bwUs',WATCH.length-cn,'美股');
+}
 
-function sse(url,handlers,{progress=false}={}){
+function sse(url,handlers,{phases=null}={}){
   out.innerHTML=''; stage.textContent=''; busy(true);
-  if(progress) startProg(); else $('#prog').classList.remove('on');
+  if(phases) startProg(phases); else $('#prog').classList.remove('on');
   const es=new EventSource(url);
   for(const [k,fn] of Object.entries(handlers)) es.addEventListener(k,e=>fn(JSON.parse(e.data)));
   es.addEventListener('stage',e=>{const d=JSON.parse(e.data);
-    if(progress) onStage(d); else stage.textContent=d.text||'';});
+    if(phases) onStage(d); else stage.textContent=d.text||'';});
   es.addEventListener('error',e=>{
     let m='连接中断'; try{m=JSON.parse(e.data).message}catch{}
     stage.textContent=m; endProg(false); busy(false); es.close();
   });
-  es.addEventListener('done',()=>{endProg(progress); busy(false); es.close(); loadHist();});
+  es.addEventListener('done',()=>{endProg(!!phases); busy(false); es.close(); loadHist();});
   return es;
 }
 
@@ -271,9 +297,12 @@ function renderTl(){
            onclick="event.stopPropagation();keepHist('${esc(x.file)}')">${x.keep?'★':'☆'}</span>`
       : '';
     if(x.kind==='mine'){
+      const wm=x.scope==='watch';
       return head+`<div class="tlrow" onclick="openHist(${i})">
-        <span class="tlday">${day}</span><span class="tlico">⛏</span>
-        <span class="tlmain">${x.market==='cn'?'A股':'美股'}挖掘 · Top${x.top}</span>
+        <span class="tlday">${day}</span><span class="tlico">${wm?'★':'⛏'}</span>
+        <span class="tlmain">${x.market==='cn'?'A股':'美股'}${wm
+          ?`自选池 · 值得买 ${x.top}/${x.candidates}`
+          :`市场挖掘 · Top${x.top}`}</span>
         <span class="tlsub">${x.totalMs?Math.round(x.totalMs/1000)+'s':''}${x.modelCalls?' · '+x.modelCalls+'次调用':''}</span>
         ${star}
       </div>`;
@@ -314,13 +343,16 @@ async function openHist(i){
       const profiles=(d.candidates||[]).map(c=>({...c,market:d.market,
         tier:typeof c.tier==='string'?{name:c.tier}:c.tier,
         band:c.pv!=null?{ok:true,pv:c.pv}:null}));
-      out.innerHTML=`<div class="card dim">历史记录 · ${esc(when)} · ${d.market==='cn'?'A股':'美股'}挖掘${d.model?' · '+esc(d.model):''}${d.totalMs?' · '+Math.round(d.totalMs/1000)+'s':''}</div>`;
+      const wm=d.scope==='watch';
+      out.innerHTML=`<div class="card dim">历史记录 · ${esc(when)} · ${d.market==='cn'?'A股':'美股'}${wm?'自选池挖掘':'市场挖掘'}${d.model?' · '+esc(d.model):''}${d.totalMs?' · '+Math.round(d.totalMs/1000)+'s':''}</div>`;
       if(d.meta)out.insertAdjacentHTML('beforeend',renderCollected(d.meta,d.watch));
-      if((d.coarse||[]).length)out.insertAdjacentHTML('beforeend',
+      if(!wm&&(d.coarse||[]).length)out.insertAdjacentHTML('beforeend',
         renderCoarse({calls:d.modelCalls?d.modelCalls-1:d.coarse.length,
           picks:(d.candidates||[]).filter(c=>!c.isWatch).length,batches:d.coarse}));
-      out.insertAdjacentHTML('beforeend',renderTop({verdict:{ok:true,top:d.top||[],note:d.note,
-        rejected:d.rejected||[],quotas:d.quotas||null},watch:d.watch,profiles}));
+      out.insertAdjacentHTML('beforeend',renderTop({scope:d.scope||'market',
+        verdict:{ok:true,top:d.top||[],note:d.note,rejected:d.rejected||[],
+          quotas:d.quotas||null,pool:(d.candidates||[]).length},
+        watch:d.watch,profiles}));
     }
   }catch{out.innerHTML='<div class="card err">记录读取失败</div>'}
 }
@@ -391,8 +423,10 @@ qEl.addEventListener('keydown',e=>{
 });
 
 // ── 自选池 ───────────────────────────────────────────────
-// 纯手动进出：挖掘时池内票跳过粗筛直通深度补数，最多占 Top 一半席位。
+// 纯手动进出。v0.6：自选池有自己的挖掘入口（三阶段，不粗筛），
+// 与市场挖掘各跑各的、各出各的榜，互不占用名额。
 let WATCH=[], WATCH_HINT=10;
+const isWatched=c=>WATCH.some(w=>String(w.code).toUpperCase()===String(c).toUpperCase());
 async function loadWatch(){
   try{
     const d=await (await fetch('/api/watchlist')).json();
@@ -403,8 +437,9 @@ async function loadWatch(){
 function renderWatch(){
   const n=WATCH.length, cn=WATCH.filter(x=>x.market==='cn').length;
   $('#watchsum').textContent=n?`自选池（${n}）· A股 ${cn} · 美股 ${n-cn}`:'自选池（空）';
+  syncWatchBtns();
   if(!n){
-    $('#wl').innerHTML='<div class="tlrow dim">搜索框联想里点「＋自选」，或在上方输入代码加入。挖掘时市场独占 Top 10。</div>';
+    $('#wl').innerHTML='<div class="tlrow dim">搜索框联想里点「＋自选」，或在上方输入代码加入。加完点下面的「挖掘自选」，只跑池内这些票。</div>';
     return;
   }
   $('#wl').innerHTML=WATCH.map((x,i)=>`<div class="wrow">
@@ -415,7 +450,7 @@ function renderWatch(){
     <span class="wx" title="移出自选池" onclick="watchRemove(${i})">✕</span>
   </div>`).join('');
   if(n>WATCH_HINT)$('#wl').insertAdjacentHTML('beforeend',
-    `<div class="whint">⚠ 池子超过 ${WATCH_HINT} 只：每轮挖掘的阶段3会逐股补数（含新闻检索），耗时随池子线性增加</div>`);
+    `<div class="whint">⚠ 池子超过 ${WATCH_HINT} 只：自选池挖掘会逐股补数（含新闻检索），耗时随池子线性增加</div>`);
 }
 async function watchAdd(){
   const q=$('#wq').value.trim(); if(!q)return;
@@ -458,17 +493,37 @@ function analyze(){
     attribution:a=>out.insertAdjacentHTML('beforeend',renderAttr(a)),
   });
 }
+// 全市场挖掘（四阶段）。自选池不再注入——池子要单独看就点自选面板里的按钮。
 function mine(m){
   sse('/api/mine?market='+m,{
     collected:d=>out.innerHTML=renderCollected(d.meta,d.watch),
     coarse:d=>out.insertAdjacentHTML('beforeend',renderCoarse(d)),
     verdict:d=>out.insertAdjacentHTML('beforeend',renderTop(d)),
-  },{progress:true});
+  },{phases:PHASES_MARKET});
+}
+// 自选池挖掘（三阶段）。只收池内这几只，跳过粗筛，整池一次裁决。
+function mineWatch(m){
+  $('#watch').open=true;
+  sse('/api/mine/watch?market='+m,{
+    collected:d=>out.innerHTML=renderCollected(d.meta,d.watch),
+    verdict:d=>out.insertAdjacentHTML('beforeend',renderTop(d)),
+  },{phases:PHASES_WATCH});
 }
 
 function renderCollected(m,w){
+  // 自选池挖掘：池子就是点名的那几只，报「并入几只 / 谁没找到」才有意义；
+  // 全市场的 universe/pool 两行在这里没有信息量。
+  if((m&&m.scope==='watch')||(!m.universe&&w&&w.pool)){
+    return `<div class="card"><b>阶段1 · 自选池信息收集</b>
+      <div class="row"><span class="k">池内标的</span><span>${w?w.pool:'—'} 只</span></div>
+      <div class="row"><span class="k">已并入</span><span>${w?w.joined:'—'} 只${w&&w.missing&&w.missing.length?' <span class="y">· 未找到：'+esc(w.missing.join('、'))+'</span>':''}</span></div>
+      <div class="row"><span class="k">耗时</span><span>${(m.elapsedMs/1000).toFixed(0)}s</span></div>
+      ${(m.caveats||[]).length?'<div class="dim" style="margin-top:8px">已知字段缺口：<ul>'+m.caveats.map(c=>'<li>'+esc(c)+'</li>').join('')+'</ul></div>':''}
+    </div>`;
+  }
+  // 旧快照（v0.5 混排时代）仍带 watch 并入行，原样显示
   const wRow=w&&w.pool?`<div class="row"><span class="k">自选池</span>
-    <span>${w.joined}/${w.pool} 只并入（挖掘时最多占 Top 一半席位${w.missing&&w.missing.length?'；未找到：'+esc(w.missing.join('、')):''}）</span></div>`:'';
+    <span>${w.joined}/${w.pool} 只并入${w.missing&&w.missing.length?'；未找到：'+esc(w.missing.join('、')):''}</span></div>`:'';
   return `<div class="card"><b>阶段1 · 全市场信息收集</b>
     <div class="row"><span class="k">全市场</span><span>${m.universe} 只</span></div>
     <div class="row"><span class="k">池子范围内</span><span>${m.pool} 只</span></div>
@@ -509,22 +564,50 @@ const ATTR_CLS=a=>/结构性衰退|商业模式证伪/.test(a||'')?'t5'
   :/治理折价/.test(a||'')?'t3'
   :/周期性底部|一次性事件|情绪杀|流动性/.test(a||'')?'t0':'t2';
 
+// 落选状态 → 配色。陷阱与「模型没回答」都要显眼：前者是判断，后者是缺口。
+const STANCE_CLS=s=>/陷阱|证伪|衰退/.test(s||'')?'t5'
+  :/未给结论/.test(s||'')?'t4'
+  :/已修复|数据不足/.test(s||'')?'t3':'t2';
+
+/** 多区间回撤行，Top 卡与落选卡共用。口径（§2.6）必须显示，否则新旧数据静默混口径。 */
+const ddRow=p=>{const d=p.drawdowns||{};const s=p.priceSeries;
+  const c=d.coverage||{};
+  // 无 priceSeries 的是 v0.6 及更早的快照：那时回撤用未复权序列算，拆股标的会被夸大
+  const tag=!s?'<span title="v0.6 及更早：未复权口径，拆股/高分红标的跌幅被夸大">旧口径</span>'
+    :!s.usable?`<span title="${esc(s.reason||'')}">口径不可用</span>`
+    :s.adjusted?`<span title="${esc(s.source||'')}｜${esc(c.from||'')} → ${esc(c.to||'')}，${c.months||'—'} 个月点">已复权</span>`
+    :`<span title="${esc(s.reason||'')}">未复权</span>`;
+  return `<div class="dd">
+  <span>13周 ${pct(d.dd13w)}</span><span>26周 ${pct(d.dd26w)}</span>
+  <span>52周 ${pct(d.dd52w)}</span><span>3年 ${pct(d.dd3y)}</span><span>5年 ${pct(d.dd5y)}</span>${tag}</div>`;};
+
 function renderTop(d){
   const v=d.verdict;
   if(!v||!v.ok) return '<div class="card y">裁决不可用：'+esc(v&&v.reason||'')+'</div>';
+  const watch=d.scope==='watch';
   const by={}; (d.profiles||[]).forEach(p=>by[String(p.code).toUpperCase()]=p);
-  // 自选参与的运行才展示分组信息；纯市场运行保持原有形态
-  const hasGroup=!!(v.quotas&&v.quotas.watchCandidates>0);
-  let s=`<div class="card"><b>Top ${v.top.length}</b>`
-    +(hasGroup?` <span class="dim">自选组 ≤${v.quotas.watch} + 市场组 ≤${v.quotas.market}，互不补位；第一名默认展开</span>`
-             :' <span class="dim">第一名默认展开，其余点击查看</span>');
+  // v0.5 及更早的快照里市场榜混着自选组，带 quotas/group；新运行不再有
+  const legacy=!watch&&!!(v.quotas&&v.quotas.watchCandidates>0);
+
+  const how=watch&&v.batches>1?`分 ${v.batches} 批初筛 → 终裁 ${v.shortlist||0} 只 · `:'';
+  let s='<div class="card">'+(watch
+    ? `<b>自选池 · 现在值得买的 ${v.top.length}${v.pool?' / '+v.pool:''} 只</b>
+       <span class="dim">${how}其余在下方「暂不买入」里逐只给了理由，点开看</span>`
+    : `<b>Top ${v.top.length}</b>`+(legacy
+        ? ` <span class="dim">自选组 ≤${v.quotas.watch} + 市场组 ≤${v.quotas.market}（旧版混排快照）</span>`
+        : ' <span class="dim">第一名默认展开，其余点击查看</span>'));
+  if(watch&&!v.top.length)
+    s+='<div class="y" style="margin-top:10px">池内当前没有一只达到买入标准——这是结论，不是故障。</div>';
+
   v.top.forEach((x,i)=>{
     const p=by[String(x.code).toUpperCase()]||{};
     const cur2=p.market==='cn'?'¥':'$';
     const mos=p.band&&p.band.pv!=null?pct(1-p.band.pv):'—';
-    const dd=p.drawdowns||{};
     const first=String(x.thesis||'').split(/(?<=[。！？])/)[0]||'';
-    const grp=hasGroup?(x.group==='自选'?'<span class="grp grpW">自选</span>':'<span class="grp grpM">市场</span>'):'';
+    // 自选榜标「不在挖掘池内」（口径适配有限）；市场榜标「已自选」（这只你在盯）
+    const grp=watch?(p.outOfPool?'<span class="grp grpM">不在挖掘池内</span>':'')
+      :legacy?(x.group==='自选'?'<span class="grp grpW">自选</span>':'<span class="grp grpM">市场</span>')
+      :(isWatched(x.code)?'<span class="grp grpW">已自选</span>':'');
     s+=`<details class="pick"${i===0?' open':''}>
       <summary>
         <div class="pickL">
@@ -541,10 +624,7 @@ function renderTop(d){
       </summary>
       <div class="body">
         <p>${esc(x.thesis)}</p>
-        <div class="dd">
-          <span>13周 ${pct(dd.dd13w)}</span><span>26周 ${pct(dd.dd26w)}</span>
-          <span>52周 ${pct(dd.dd52w)}</span><span>3年 ${pct(dd.dd3y)}</span><span>5年 ${pct(dd.dd5y)}</span>
-        </div>
+        ${ddRow(p)}
         ${p.tier?.name?`<div class="dim">估值档位 ${esc(p.tier.name)}${p.fScore!=null?' · F-Score '+p.fScore:''}</div>`:''}
         ${x.catalyst?'<div class="dim">催化剂：'+esc(x.catalyst)+'</div>':''}
         ${(x.risks||[]).length?'<div class="dim">关键风险：<ul>'+x.risks.map(r=>'<li>'+esc(r)+'</li>').join('')+'</ul></div>':''}
@@ -553,8 +633,45 @@ function renderTop(d){
       </div>
     </details>`;
   });
-  // 自选池落选区：池内票没进 Top 的逐只给原因，判为陷阱的提示建议移出（不代删）
-  if(hasGroup){
+
+  // ── 自选榜的落选区：池内每只都在这儿有交代，点开是三句话 + 关键数据 ──
+  if(watch&&(v.rejected||[]).length){
+    s+=`<div style="margin-top:16px;padding-top:12px;border-top:1px dashed var(--line)">
+      <b class="dim">暂不买入（${v.rejected.length}）</b>
+      <span class="dim">· 点开看为什么、什么条件下重新考虑</span></div>`;
+    v.rejected.forEach(x=>{
+      const p=by[String(x.code).toUpperCase()]||{};
+      const cur2=p.market==='cn'?'¥':'$';
+      const mos=p.band&&p.band.pv!=null?pct(1-p.band.pv):'—';
+      const first=String(x.why||'').split(/(?<=[。！？])/)[0]||'';
+      s+=`<details class="pick">
+        <summary>
+          <div class="pickL">
+            <span class="nm2">${esc(p.name||x.code)}</span>
+            <span class="dim"> ${esc(x.code)} · ${esc(p.industry||'')}</span>
+            <span class="caret">▶</span>
+            <div class="one">${esc(first)}</div>
+          </div>
+          <div class="pickR">
+            <div>${cur2}${n(p.price)}</div>
+            <div><span class="tier ${STANCE_CLS(x.stance)}">${esc(x.stance||'落选')}</span></div>
+            <div class="dim">安全边际 ${mos}</div>
+          </div>
+        </summary>
+        <div class="body">
+          <p>${esc(x.why||'')}</p>
+          ${x.keyData?`<div class="dim">关键数据：${esc(x.keyData)}</div>`:''}
+          ${ddRow(p)}
+          ${p.tier?.name?`<div class="dim">估值档位 ${esc(p.tier.name)}${p.fScore!=null?' · F-Score '+p.fScore:''}</div>`:''}
+          ${p.outOfPool?'<div class="dim">⚠ 不在挖掘池内（ST／流动性／行业排除），估值口径适配有限</div>':''}
+          ${x.suggestRemove?'<div class="y">⚠ 建议移出自选池 —— 系统不代删，要移请点上面池子里的 ✕</div>':''}
+          ${x.unanswered?'<div class="y">⚠ 本轮没拿到这只的结论，建议重跑，或用上方搜索框对它单独做一次分析</div>':''}
+        </div>
+      </details>`;
+    });
+  }
+  // 旧版混排快照的自选落选区（只有一行 why，没有关键数据）
+  if(legacy){
     const wr=(v.rejected||[]).filter(x=>x.group==='自选');
     if(wr.length){
       s+=`<div style="margin-top:12px;padding-top:12px;border-top:1px dashed var(--line)"><b class="dim">自选池落选（${wr.length}）</b>`
@@ -565,11 +682,40 @@ function renderTop(d){
         }).join('')+'</div>';
     }
   }
-  // 补数失败提示不设 hasGroup 门控：失败时 profiles 里没有该票，
-  // 配额区看不到它，门控内提示会静默吞掉「用户加了票却消失」这件事
+  // 补数失败要显式报出：失败的票不在 profiles 里，落选区也看不到它，
+  // 不提示就等于「用户加了票却静默消失」
   if(d.watch&&d.watch.failed&&d.watch.failed.length)
-    s+=`<div class="y">⚠ 自选池补数失败：${esc(d.watch.failed.join('、'))}</div>`;
+    s+=`<div class="y">⚠ 深度补数失败，本轮未参与裁决：${esc(d.watch.failed.join('、'))}</div>`;
+  if(d.watch&&d.watch.missing&&d.watch.missing.length)
+    s+=`<div class="y">⚠ 未在全市场列表中找到：${esc(d.watch.missing.join('、'))}</div>`;
+  if(watch&&v.batchFailed&&v.batchFailed.length)
+    s+=`<div class="y">⚠ 初筛有批次失败：${esc(v.batchFailed.join('；'))}——该批标的在上方标为「模型未给结论」</div>`;
+  if(watch&&v.unanswered)
+    s+=`<div class="y">⚠ ${v.unanswered} 只未拿到结论，建议重跑一次；单只可用上方搜索框做单股分析</div>`;
   if(v.note)s+='<div class="dim" style="margin-top:12px;padding-top:12px;border-top:1px dashed var(--line)">整体判断：'+esc(v.note)+'</div>';
+  // 分层数字规则 L3：模型基于自身知识的判断与质疑。必须与实测数据**显著区分**——
+  // 它没有经过本系统验证，混在一起呈现比不给更糟。
+  if(v.externalNotes&&v.externalNotes.length){
+    s+='<div style="margin-top:12px;padding-top:12px;border-top:1px dashed var(--line)">'
+      +'<b class="y">模型的外部知识判断（未经本系统验证，请自行核实）</b>'
+      +v.externalNotes.map(x=>{
+        const nm=x.code?((by[String(x.code).toUpperCase()]||{}).name||x.code):null;
+        return `<div style="margin:6px 0;font-size:13px">${nm?'<b>'+esc(nm)+'</b> — ':''}${esc(x.claim)}`
+          +(x.why?`<div class="dim" style="margin-left:8px">依据：${esc(x.why)}</div>`:'')+'</div>';
+      }).join('')+'</div>';
+  }
+  // 取数留痕：让用户能看出这一轮结论有多少是模型主动取数支撑的
+  if(v.toolLog&&v.toolLog.length){
+    const byName={}; v.toolLog.forEach(x=>{byName[x.name]=(byName[x.name]||0)+1;});
+    const sum=Object.entries(byName).map(([k,n])=>`${esc(k)}×${n}`).join('　');
+    s+=`<details style="margin-top:10px"><summary class="dim">本轮主动取数 ${v.toolLog.length} 次：${sum}`
+      +`${v.budgetExhausted?'　<span class="y">（预算用尽）</span>':''}</summary>`
+      +'<div style="font-size:12px" class="dim">'
+      +v.toolLog.map(x=>`第${x.round}轮 ${esc(x.name)} ${esc(JSON.stringify(x.input||{}))} → ${x.chars} 字${x.truncated?'（已截断）':''}`).join('<br>')
+      +'</div></details>';
+  }
+  if(v.toolsDisabled)
+    s+='<div class="y">⚠ 本轮取数工具不可用（渠道不支持），已退回纯档案裁决</div>';
   if(v.suspectNumbers&&v.suspectNumbers.length)
     s+='<div class="y">⚠ 以下数字无法追溯到输入数据，请自行核实：'+esc(v.suspectNumbers.map(x=>x.value).join('、'))+'</div>';
   return s+'</div>';

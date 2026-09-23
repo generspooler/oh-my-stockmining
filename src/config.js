@@ -28,9 +28,10 @@ export const SCREENING = {
   // ── 阶段 2 · 粗筛分批（新架构）────────────────────────────────
   // 模型在批内横向比较。各批入选上限**按市场分别设定**。
   //
-  // v0.5：名额合计 50 → 30——自选组占 Top 一半后市场组只需 5 席，
-  // 30 进 5 的筛选密度（6:1）已足够，多出的名额只增加阶段 3 补数量与耗时。
-  // 批内配比不变，全部按 0.6 系数等比缩减：
+  // v0.6：名额合计 30 → 50（回到 v0.4 标定）。自选池挖掘独立成流水线后，
+  // 市场榜的 10 席全归市场候选，30 进 10 的筛选密度只有 3:1，裁决无从挑拣；
+  // 50 进 10（5:1）是本系统一直在跑的标定。代价是阶段 3 补数从 30 只回到 50 只。
+  // 批内配比自始至终不变，目标批恒占 50%：
   //
   // A股：6 批 = 中高股息（横切全行业）+ 5 个行业批。
   // 中高股息仍独占 50% 名额——A股传统深度价值集中在能持续派现的资产上。
@@ -44,8 +45,8 @@ export const SCREENING = {
   // 美股不做股息分流——GICS 金融与房地产（高股息主力）已在池子层排除，剩余标的
   // 股息率普遍偏低，横切出来的批规模不足以支撑横向比较。
   batchPicks: {
-    cn: { 中高股息: 15, 消费: 4, '制造与周期': 4, 其他: 3, 医药: 2, 科技: 2 },  // 合计 30
-    us: { 科技: 15, 消费: 4, 医药: 4, '制造与周期': 4, 其他: 3 },               // 合计 30
+    cn: { 中高股息: 25, 消费: 7, '制造与周期': 7, 其他: 5, 医药: 3, 科技: 3 },  // 合计 50
+    us: { 科技: 25, 消费: 7, 医药: 7, '制造与周期': 7, 其他: 4 },               // 合计 50
   },
   defaultPicks: 5,
 
@@ -71,16 +72,48 @@ export const SCREENING = {
   // ── 阶段 4 · 总裁决 ─────────────────────────────────────────
   topN: envNum('MINE_TOP_N', 10),
 
-  // ── 自选池（SYSTEM_DEFINITION §3.2 自选池）────────────────────
-  // 用户手动维护的长期跟踪名单，挖掘时跳过粗筛直通深度补数。
-  // topN 是自选组席位上限：默认 Top 的一半，跟 MINE_TOP_N 联动
-  // （MINE_TOP_N=8 时自选 4、市场 4）。软配额——自选组不足额时总榜
-  // 如实缺额，不用市场票补位（用户决策 2026-09-22）；自选为空时
-  // 市场组回到 topN（现状行为）。
+  // ── 自选池挖掘（SYSTEM_DEFINITION §3.3）───────────────────────
+  // v0.6 用户决策 2026-09-23：自选池与市场挖掘**彻底分开**，两条流水线、
+  // 两个按钮、两张榜。自选票不再直通市场粗筛、不再占市场 Top 席位，
+  // 分组配额（quotas/capByGroup）随之退役。
+  //
+  // 这里的 topN 是**自选池自己那张榜**的名额，与市场榜的 SCREENING.topN 无关：
+  // 池内前 8 只给完整分析，其余逐只给落选理由（三句话 + 关键数据），一只都不省略。
+  // 取 8 而非 topN/2：池子通常 10~20 只，选 8 只既保留筛选意义，
+  // 又不至于把值得买的挤出详析区。
   watch: {
-    topN: envNum('MINE_WATCH_TOP_N', Math.floor(envNum('MINE_TOP_N', 10) / 2)),
-    // 池子超过此数在网页提示（阶段3逐股补数，耗时随池子线性增加）。不硬拦。
+    topN: envNum('MINE_WATCH_TOP_N', 8),
+    // 池子超过此数在网页提示（逐股补数，耗时随池子线性增加）。不硬拦。
     sizeHint: envNum('MINE_WATCH_SIZE_HINT', 10),
+  },
+
+  // ── 多区间回撤口径（§2.6）────────────────────────────────────
+  // 回撤与区间收益是「跌幅与基本面背离」这条判断标准的唯一数值输入，
+  // 错了排序就错了。此前无定义，实现里四个缺陷（不复权 / 短序列静默降级 /
+  // dd 与 ret 窗口不一致 / 按数组下标当月份）因而无人可依据。
+  drawdown: {
+    // 区间以**月**为单位。13周=3月、26周=6月、52周=12月、3年=36月、5年=60月。
+    // 「n 个月 = n 个区间」，回撤与收益同窗口——此前 dd(12) 量 11 个月、ret(12) 量 12 个月。
+    windows: { dd13w: 3, dd26w: 6, dd52w: 12, dd3y: 36, dd5y: 60 },
+    // 序列起点固定，不随当天滚动——滚动的 beg 会让缓存键每天失效一次。
+    // 20150101 给出约 141 个月点，足够 60 月窗口且留足余量。
+    beg: '20150101',
+    // 窗口内至少要有几个点才算数。只有起点合格但中间大面积缺失时，
+    // 最高价会被少数点决定，回撤失真——这与「点数不足就置空」是同一条取向。
+    minPointsPerWindow: 2,
+    // 兜底顺位 3 的拆股检测：相邻月收盘比值接近整数倍即判为拆股伪影。
+    //
+    // 容差 15% **刻意偏向过度包含**，因为两类错误的代价极不对称：
+    // 该检测只在「不复权兜底」这条已经降级的路径上跑，误报的后果是该区间置空（安全），
+    // 漏报的后果是把一个错的跌幅喂给模型（正是本次要修的 bug）。
+    //
+    // 取值依据是实测的拆股当月真实漂移，比直觉大得多：
+    //   KLAC 6:1 → 比值 6.37（月内另跌 6%）｜NVDA 10:1 → 8.87（月内另跌 11%）
+    // 容差 6% 会把这两个都漏掉，因此必须放宽到 15%。
+    // 已知代价：单月跌幅落在约 −33%~−55% 的标的会被保守判为拆股、该区间置空。
+    // 在不复权兜底路径上这是可接受的——模型仍拿到估值与财务，且会被告知跌幅为何缺失。
+    splitRatios: [2, 3, 4, 5, 6, 7, 8, 10, 15, 20],
+    splitTolerance: 0.15,
   },
 
   // ── 估值口径（§2.3）──────────────────────────────────────────
@@ -134,19 +167,37 @@ export const SCREENING = {
 export const NARRATIVE = {
   baseUrl: envStr('ANTHROPIC_BASE_URL', 'https://api.anthropic.com'),
   // harness 运行时用 claude（Anthropic Messages API 兼容）
-  model: envStr('MINE_MODEL', 'glm-5.3-flash'),
-  fallbacks: envStr('MINE_FALLBACK_MODELS', 'deepseek-V4.1-flash').split(',').map((s) => s.trim()).filter(Boolean),
-  // glm-5.3-flash 是思考型模型，reasoning token 计入 max_tokens。
-  // 实测归因提示词（system 850 + user 1001 字符）下 reasoning 就吃掉 3979 token，
-  // 给 4000 会导致 text_tokens=0、stop_reason=max_tokens、正文为空。
+  //
+  // 模型名可以是**渠道 ID**（东财/ModelBest 网关注册的 id，如 GPT_bhlzrh）或裸模型名。
+  // 风险不对称：裸名同样能调通（网关按模型名路由到某个渠道，实测 gpt-5.6-sol 可用），
+  // 但渠道 ID 唯一确定一条渠道，模型名可能对应多个渠道、路由到哪个不由我们决定。
+  // 因此默认写渠道 ID——自主可控优先于可读。
+  model: envStr('MINE_MODEL', 'GPT_bhlzrh'),
+  // 降级链：主模型失败（空正文 / HTTP 错误 / 未声明协议）时依次换。
+  // 必须写 []（而不是注释掉整行）——llm.js 顶层就解引用这个字段，
+  // 缺字段会让 import 期直接崩在 `.filter`，报错还完全看不出是配置问题。
+  fallbacks: envStr('MINE_FALLBACK_MODELS', '').split(',').map((s) => s.trim()).filter(Boolean),
+  // 协议探测开关（§6.2）。网关每个渠道声明了它支持的协议：
+  //   Anthropic 派 → /v1/messages
+  //   OpenAI 派   → /v1/chat/completions
+  // 本项目原本只会说 Anthropic，于是「支持 OPENAI_HTTP 的渠道」例如 GPT 系
+  // 一律 400「该模型未声明支持 Anthropic Messages」，看起来像调用没触发，实为静默失败。
+  // 现在两种协议都实现，默认探测；怀疑探测误判时用 MINE_PROTOCOL=anthropic|openai 钉死。
+  protocol: envStr('MINE_PROTOCOL', 'auto'),
   // 参考项目 my-stock-track 用 32000，这里对齐。
   // 思考型模型的 reasoning 与正文共用 max_tokens。输入越大思考越久：
   // 实测 1765 行的粗筛表让 reasoning 吃掉 31836/32000，正文一个字都吐不出来。
-  maxTokens: envNum('MINE_MAX_TOKENS', 64000),
+  maxTokens: envNum('MINE_MAX_TOKENS', 100000),
   // 单次调用的最低预算：低于此思考就可能吃光配额
   minTokens: 12000,
-  // 无数据看门狗：参考项目实测 GLM 经代理可 ~150s 才吐首 token，给足余量避免误杀
   firstTokenTimeoutMs: envNum('MINE_FIRST_TOKEN_TIMEOUT_MS', 240000),
+  // 单次调用总时长上限。看门狗只管「连接是否活着」，思考型模型持续吐 thinking
+  // 会把它无限重置——实测一次自选裁决思考 15 分钟后正文为空。卡住要响亮失败。
+  callTimeoutMs: envNum('MINE_CALL_TIMEOUT_MS', 20 * 60e3),
+  // 自选池裁决单次最多处理多少只，超过即分批（v0.6.1）。
+  // 思考 15 分钟后 stop_reason=end_turn、正文 0 字。15 只的输出量与市场裁决相当，
+  // 是已知能稳定跑通的规模。
+  watchBatchSize: envNum('MINE_WATCH_BATCH_SIZE', 15),
   // 两个 pass（§3.2 第 4 层）：归因逐只跑，裁决排序一次性处理全部候选。
   // 排序是横截面判断——要从 N 只里挑 8 只并满足行业集中度约束，模型必须同时看到全部候选，
   // 逐只调用根本排不出序。故裁决为单次调用而非 ×N。
@@ -155,6 +206,41 @@ export const NARRATIVE = {
   // 不再因校验失败丢弃整份输出（调用数从 ~93 降到 31）。
   schemaRetries: 1,
   concurrency: envNum('MINE_LLM_CONCURRENCY', 3),
+
+  // ── 工具循环（细筛取数能力）────────────────────────────────
+  // 探针实测（.run/probe-tools.mjs）：本渠道 OpenAI 协议支持完整工具往返
+  // （轮1 stop=tool_calls、轮2 回填 role:'tool' 后正常续写）；
+  // Anthropic 协议在本渠道不可用——它只声明 OPENAI_HTTP/OPENAI_RESPONSE。
+  tools: {
+    // ── 预算：**总调用数为主闸、轮数为辅闸**（用户决策 2026-09-23）────
+    // 只封轮数是不够的：一轮可以并行发多个调用，12 轮能变成 70+ 次取数。
+    //
+    // 软/硬两级。到软上限时**不掐断**，而是把「软预算已用尽，若你判断某只票的
+    // 结论会因缺这份数据而错可继续，最多再 N 次」作为工具结果回给模型；
+    // 越过硬上限才撤掉 tools 逼出结论。这落实「相信模型」——
+    // 分配权在模型，代码只守边界，且边界是如实告知的而非静默的。
+    softToolCalls: envNum('MINE_TOOL_SOFT_CALLS', 18),
+    maxToolCalls: envNum('MINE_TOOL_MAX_CALLS', 26),
+    maxRounds: envNum('MINE_TOOL_MAX_ROUNDS', 14),
+    // 工具循环的**总**时长上限。NARRATIVE.callTimeoutMs 是 per-stream 的，
+    // 多轮循环会拿到 N × 20 分钟，等于没有上限，必须另设一个总闸。
+    loopTimeoutMs: envNum('MINE_TOOL_LOOP_TIMEOUT_MS', 30 * 60e3),
+    // 单次工具返回的字符上限，在 llm.js 里统一截断。
+    // 这是本方案最大的 context 膨胀风险的唯一收口处：实测 77k token 输入曾只剩
+    // 164 token 给正文、模型吐出 0 字（见 maxTokens 那段注释）。
+    // 取 12000：财报正文是本方案的主要价值来源，而实测 MD&A 普遍 1.8~4.4 万字符
+    // （AAPL 1.8 万 / NVDA 3.4 万 / UNH 3.6 万 / LULU 4.4 万），
+    // 6000 只能看到开头一小段；12000 能覆盖「概述 + 经营结果」这两块最有用的部分。
+    maxResultChars: envNum('MINE_TOOL_MAX_RESULT_CHARS', 12000),
+    // 按入口分别设预算。单股是用户主动点名深挖一只，可以大方给；
+    // 市场深挖那一段要摊给好几只，因此按「点名只数」动态放大而不是固定值。
+    budgets: {
+      watch: { soft: envNum('MINE_TOOL_WATCH_SOFT', 18), hard: envNum('MINE_TOOL_WATCH_HARD', 26) },
+      single: { soft: envNum('MINE_TOOL_SINGLE_SOFT', 8), hard: envNum('MINE_TOOL_SINGLE_HARD', 12) },
+      // 市场深挖：每只点名标的的取数配额，乘以点名数即为本段预算
+      marketPerPick: envNum('MINE_TOOL_MARKET_PER_PICK', 3),
+    },
+  },
 };
 
 /** 缓存 TTL 分级（§6.3） */

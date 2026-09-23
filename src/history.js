@@ -46,11 +46,13 @@ function upsert(entry) {
  * 组装一次挖掘的完整记录。
  * 关键：粗筛的 picks 必须保留模型的推理（why / guess / checkNext），
  * 此前只存了代码数组，等于把「模型是怎么从 4413 只收敛过来的」整段丢掉。
+ * scope：'market'（全市场四阶段）或 'watch'（自选池三阶段）。两种榜各自成组、
+ * 互不覆盖——同一天两条流水线都跑过，历史里要能各留各的。
  * watch：自选池当轮状态（规模/并入/未找到/补数失败），供前端与复盘（§7）用。
  */
-export function buildMinePayload({ market, meta, coarse, profiles, verdict, totalMs, modelCalls, watch }) {
+export function buildMinePayload({ market, scope = 'market', meta, coarse, profiles, verdict, totalMs, modelCalls, watch }) {
   return {
-    market, at: new Date().toISOString(), totalMs, modelCalls, meta,
+    market, scope, at: new Date().toISOString(), totalMs, modelCalls, meta,
     watch: watch || null,
     coarse: (coarse?.results || []).map((r) => ({
       bucket: r.bucket, label: r.label || r.bucket, scanned: r.scanned ?? null,
@@ -62,12 +64,22 @@ export function buildMinePayload({ market, meta, coarse, profiles, verdict, tota
     })),
     top: verdict?.top || [], rejected: verdict?.rejected || [],
     note: verdict?.note || null, model: verdict?.model || null,
-    quotas: verdict?.quotas || null,
+    // 分层数字规则的 L3：模型基于自身知识的判断与质疑（§5.3）
+    externalNotes: verdict?.externalNotes || [],
+    // 取数留痕。**只存元信息，不存返回正文**——正文会把快照撑到不可用
+    // （本文件对 seriesRows 也是这么处理的）。
+    toolLog: verdict?.toolLog || [],
+    toolCalls: verdict?.toolCalls ?? 0,
+    toolsDisabled: verdict?.toolsDisabled || undefined,
     candidates: (profiles || []).map((p) => ({
       code: p.code, name: p.name, industry: p.industry, price: p.price,
       pv: p.band?.pv ?? null, tier: p.band?.tier?.name ?? null, fScore: p.fScore,
       drawdowns: p.drawdowns,
+      // 回撤口径（§2.6）。旧快照没有这个字段 → 回放时按「旧口径（未复权）」提示，
+      // 否则历史与新数据会静默混口径。
+      priceSeries: p.priceSeries || null,
       isWatch: !!p.isWatch || null,
+      outOfPool: !!p.outOfPool || null,   // 回看时仍要能看到「不在挖掘池内」的口径提醒
       coarseGuess: p.coarseGuess || null,
       coarseWhy: p.coarseWhy || null,        // 此前丢失
       checkNext: p.checkNext || null,        // 此前丢失
@@ -77,18 +89,24 @@ export function buildMinePayload({ market, meta, coarse, profiles, verdict, tota
 
 // ── 保存 ──────────────────────────────────────────────
 
-/** 保存一次全市场挖掘。文件名带时间戳，同日多次并存，由用户标记保留哪条。 */
+/**
+ * 保存一次挖掘（市场或自选池）。文件名带时间戳，同日多次并存，由用户标记保留哪条。
+ * 自选榜与市场榜分属不同 group：次日清理按组去重，混在一起会让当天的自选记录
+ * 被市场记录顶掉（或反过来）。
+ */
 export function saveMine(payload) {
   ensure();
   const date = today();
-  const group = `mine-${payload.market}-${date}`;
+  const scope = payload.scope === 'watch' ? 'watch' : 'market';
+  const group = `mine-${scope === 'watch' ? 'watch-' : ''}${payload.market}-${date}`;
   const file = `${group}-${stamp()}.json`;
   const body = { kind: 'mine', date, group, ...payload };
   fs.writeFileSync(path.join(SNAP_DIR, file), JSON.stringify(body, null, 1));
   upsert({
     file, kind: 'mine', date, group, keep: false,
     at: body.at || new Date().toISOString(),
-    market: payload.market,
+    market: payload.market, scope,
+    rejected: payload.rejected?.length || 0,
     top: payload.top?.length || 0,
     candidates: payload.candidates?.length || 0,
     totalMs: payload.totalMs ?? null,
@@ -201,7 +219,9 @@ export function listHistory({ limit = 200 } = {}) {
           attribution: d.attribution?.category || null, hasLlm: !!d.attribution?.ok });
       } else {
         extras.push({ file: f, kind: 'mine', date, group, keep: false, at: d.at,
-          market: d.market, top: d.top?.length || 0, candidates: d.candidates?.length || 0,
+          market: d.market, scope: d.scope === 'watch' ? 'watch' : 'market',
+          top: d.top?.length || 0, candidates: d.candidates?.length || 0,
+          rejected: d.rejected?.length || 0,
           totalMs: d.totalMs ?? null, modelCalls: d.modelCalls ?? null, model: d.model || null });
       }
     } catch {}

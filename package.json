@@ -1,9 +1,9 @@
 {
   "name": "my-stock-mining",
-  "version": "0.4.0",
+  "version": "0.7.1",
   "private": true,
   "type": "module",
-  "description": "低估价值挖掘系统：单股低估判定 + 全市场错杀低估 Top",
+  "description": "低估价值挖掘系统：单股低估判定 + 全市场错杀低估 Top + 自选池挖掘",
   "scripts": {
     "start": "node mine.js start",
     "stop": "node mine.js stop",
@@ -13,5 +13,7 @@
     "dev": "node --watch server.js",
     "test": "node --test test/*.test.js"
   },
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": ">=20"
+  }
 }

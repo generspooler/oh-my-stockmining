@@ -1,7 +1,7 @@
 // 阶段 3 · 深度补数（SYSTEM_DEFINITION §3 新架构）。
 // 仅对粗筛入围的 ≤47 只执行。此阶段仍**不做任何淘汰**，只把信息补厚。
 import * as val from './valuation.js';
-import * as tx from './sources/tencent.js';
+import { adjustedMonthly, drawdowns, renderCoverage } from './metrics/returns.js';
 import { normalizedEarnings, normalizedRoe, isCyclical, ttmRevenue } from './metrics/normalize.js';
 import { multipleRoute, isFinancial } from './classify.js';
 import * as em from './sources/em.js';
@@ -9,36 +9,16 @@ import { fetchNews, renderNews } from './news.js';
 import { safeDiv, pool } from './util.js';
 import { LIMITS } from './config.js';
 
-/** 多区间回撤：细筛阶段已有月线，任意区间都能现算，无需额外请求。 */
-export function drawdowns(monthly) {
-  if (!monthly?.length) return {};
-  const last = monthly[monthly.length - 1];
-  const win = (n) => monthly.slice(Math.max(0, monthly.length - n));
-  const dd = (n) => {
-    const w = win(n);
-    if (w.length < 2) return null;
-    const hi = Math.max(...w.map((x) => x.close));
-    return hi ? last.close / hi - 1 : null;
-  };
-  const ret = (n) => {
-    const w = win(n + 1);
-    return w.length >= 2 && w[0].close ? last.close / w[0].close - 1 : null;
-  };
-  return {
-    dd13w: dd(3), dd26w: dd(6), dd52w: dd(12), dd3y: dd(36), dd5y: dd(60),
-    ret13w: ret(3), ret26w: ret(6), ret52w: ret(12), ret3y: ret(36), ret5y: ret(60),
-    monthsAvailable: monthly.length,
-  };
-}
-
 /** 单只深度档案：估值三档 + 归一化 + 多区间回撤 + 新闻。 */
 export async function profileOne(row, newsPack) {
   const market = row.market;
   const fin = isFinancial(row.industry, market);
-  const [series, statements, monthly] = await Promise.all([
+  // 回撤走复权序列（§2.6），估值反算继续走不复权序列（val.multipleSeries 内部自取）。
+  // 同一个序列不得同时服务两种用途——这正是旧实现把拆股读成暴跌的根因。
+  const [series, statements, pricePack] = await Promise.all([
     val.multipleSeries(row).catch(() => ({ rows: [], source: '不可得' })),
     (market === 'cn' ? em.statementsCN(row.code) : em.statementsUS(row.code, em.usSuffix(row.mk))).catch(() => null),
-    tx.monthly(row.code, market, row.mk).catch(() => []),
+    adjustedMonthly(row).catch(() => ({ rows: [], adjusted: false, source: '不可得', usable: false, reason: '历史价格序列不可得' })),
   ]);
 
   const shares = row.shares ?? series.shares ?? null;
@@ -62,7 +42,13 @@ export async function profileOne(row, newsPack) {
 
   return {
     ...row,
-    drawdowns: drawdowns(monthly),
+    // 序列不可用（取不到 / 未复权且检测到拆股）时整体置空，不输出错的数
+    drawdowns: drawdowns(pricePack.usable ? pricePack.rows : []),
+    priceSeries: {
+      adjusted: !!pricePack.adjusted, source: pricePack.source,
+      splitSuspect: !!pricePack.splitSuspect, usable: !!pricePack.usable,
+      reason: pricePack.reason || null,
+    },
     normalization: norm, cyclical: cyc, route, percentiles: pcts, band,
     altRoute, altBand, routeAmbiguous: !!cyc.ambiguous,
     seriesSource: series.source, seriesPoints: series.rows?.length || 0,
@@ -90,17 +76,20 @@ const pc = (v, d = 0) => (v == null || !isFinite(v) ? '—' : `${(v * 100).toFix
 export function renderProfile(p, i) {
   const cur = p.market === 'cn' ? '¥' : '$';
   const L = [];
-  const group = p.isWatch ? '自选' : '市场';
-  L.push(`### ${i + 1}. ${p.name}（${p.code}）｜${p.industry}｜${p.market === 'cn' ? 'A股' : '美股'}｜${group}`);
+  L.push(`### ${i + 1}. ${p.name}（${p.code}）｜${p.industry}｜${p.market === 'cn' ? 'A股' : '美股'}`);
+  // 自选池挖掘里整份候选都来自用户点名，没有粗筛理由可给；市场挖掘则逐只带粗筛推理
   L.push(p.isWatch
-    ? '粗筛理由：用户自选标的——跳过粗筛直接深看。粗筛不对其裁汰，但裁决标准与市场候选完全一致'
+    ? '来源：用户自选池（长期跟踪名单，未经粗筛——入池是用户的意图，不代表已通过任何检验）'
     : `粗筛理由：${p.coarseWhy || '—'}｜初步猜测：${p.coarseGuess || '—'}｜待验证：${p.checkNext || '—'}`);
   if (p.outOfPool) L.push('⚠ 该标的不在挖掘池内（池排除项），估值方法适配度有限');
   L.push(`现价 ${cur}${f(p.price)}　市值 ${p.marketCap ? (p.marketCap / 1e8).toFixed(0) + (p.market === 'cn' ? '亿' : '亿美元') : '—'}　PE ${f(p.pe, 1)}　PB ${f(p.pb)}`);
 
   const d = p.drawdowns || {};
+  // 序列口径必须回写（§2.6 步骤 4）：模型看不到「这个序列只有 59 个点、跨了 17 年」，
+  // 就无从怀疑喂给它的跌幅。「—」一律表示该区间历史不覆盖，不是「没跌」。
+  L.push(renderCoverage(p.priceSeries, d));
   L.push(`回撤：13周 ${pc(d.dd13w)}　26周 ${pc(d.dd26w)}　52周 ${pc(d.dd52w)}　3年 ${pc(d.dd3y)}　5年 ${pc(d.dd5y)}`);
-  L.push(`区间收益：52周 ${pc(d.ret52w)}　3年 ${pc(d.ret3y)}　5年 ${pc(d.ret5y)}`);
+  L.push(`区间收益：13周 ${pc(d.ret13w)}　26周 ${pc(d.ret26w)}　52周 ${pc(d.ret52w)}　3年 ${pc(d.ret3y)}　5年 ${pc(d.ret5y)}`);
 
   L.push(`基本面：ROE ${f(p.roe, 1)}%（5年中位 ${f(p.roeMedian5, 1)}%）　毛利率 ${f(p.grossMargin, 1)}%　负债率 ${f(p.debtRatio, 1)}%　F-Score ${p.fScore ?? '—'}`);
   L.push(`　　　　营收CAGR ${pc(p.revenueCagr)}　累计FCF/净利 ${f(p.cumFcfToProfit)}　ROIC ${f(p.roic, 1)}%　利息保障 ${f(p.interestCoverage, 1)}x`);
