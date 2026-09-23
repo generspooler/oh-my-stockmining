@@ -1,0 +1,17 @@
+{
+  "name": "my-stock-mining",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "description": "低估价值挖掘系统：单股低估判定 + 全市场错杀低估 Top",
+  "scripts": {
+    "start": "node mine.js start",
+    "stop": "node mine.js stop",
+    "restart": "node mine.js restart",
+    "status": "node mine.js status",
+    "logs": "node mine.js logs",
+    "dev": "node --watch server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": { "node": ">=20" }
+}

@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>低估价值挖掘系统</title>
+<style>
+:root{--bg:#fbfaf8;--fg:#1c1a17;--dim:#6b665e;--line:#e5e0d8;--card:#fff;--acc:#8a6d3b;
+      --g:#2f7a4f;--r:#b03a2e;--y:#9a7b18;}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#16150f;--fg:#ece7dd;--dim:#9a938a;
+      --line:#2e2b24;--card:#1e1c16;--acc:#c9a227;--g:#5fb98a;--r:#e0705f;--y:#d4b03f;}}
+:root[data-theme=dark]{--bg:#16150f;--fg:#ece7dd;--dim:#9a938a;--line:#2e2b24;--card:#1e1c16;
+      --acc:#c9a227;--g:#5fb98a;--r:#e0705f;--y:#d4b03f;}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",
+     "PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;margin:0;padding-block:24px;padding-inline:16px}
+.wrap{max-width:920px;margin:0 auto}
+h1{font-size:20px;font-weight:600;margin:0 0 4px;letter-spacing:.02em}
+.sub{color:var(--dim);font-size:13px;margin-bottom:20px}
+.bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.qwrap{flex:1;min-width:180px;position:relative}
+.qwrap input{width:100%}
+.suggest{display:none;position:absolute;top:100%;left:0;right:0;z-index:20;
+  background:var(--card);border:1px solid var(--line);border-radius:6px;margin-top:4px;
+  max-height:320px;overflow-y:auto;box-shadow:0 4px 16px rgba(0,0,0,.12)}
+.suggest.on{display:block}
+.sug-item{display:flex;align-items:baseline;gap:10px;padding:9px 12px;cursor:pointer;font-size:13px}
+.sug-item:hover,.sug-item.hi{background:color-mix(in srgb,var(--acc) 10%,transparent)}
+.sug-code{font-weight:600;min-width:56px;flex-shrink:0}
+.sug-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sug-mk{font-size:11px;color:var(--dim);white-space:nowrap}
+.sug-tag{font-size:11px;color:var(--dim);white-space:nowrap;flex-shrink:0}
+.sug-add{font-size:11px;color:var(--acc);white-space:nowrap;flex-shrink:0;cursor:pointer;
+  border:1px solid var(--line);border-radius:99px;padding:1px 8px;user-select:none}
+.sug-add:hover{border-color:var(--acc);background:color-mix(in srgb,var(--acc) 12%,transparent)}
+
+/* ── 自选池面板 ────────────────────────────────────── */
+.wadd{display:flex;gap:8px;padding:10px 16px 6px}
+.wadd input{flex:1;min-width:120px}
+.wmsg{min-height:18px;font-size:12px;color:var(--dim);padding:0 16px 4px}
+.wrow{display:flex;align-items:baseline;gap:10px;padding:7px 16px;font-size:13px;
+  border-top:1px dashed transparent}
+.wrow:hover{background:color-mix(in srgb,var(--acc) 8%,transparent)}
+.wrow .ind{color:var(--dim);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  flex:1;min-width:0}
+.wx{cursor:pointer;color:var(--dim);flex:0 0 auto;padding:0 3px;font-size:12px}
+.wx:hover{color:var(--r)}
+.whint{padding:6px 16px;font-size:12px;color:var(--y)}
+.grp{display:inline-block;padding:1px 8px;border-radius:99px;font-size:11px;font-weight:600}
+.grpW{background:color-mix(in srgb,var(--acc) 20%,transparent);color:var(--acc)}
+.grpM{background:color-mix(in srgb,var(--dim) 16%,transparent);color:var(--dim)}
+input{flex:1;min-width:180px;padding:9px 12px;border:1px solid var(--line);border-radius:6px;
+      background:var(--card);color:var(--fg);font-size:14px}
+button{padding:9px 16px;border:1px solid var(--line);border-radius:6px;background:var(--card);
+       color:var(--fg);cursor:pointer;font-size:14px}
+button:hover{border-color:var(--acc)}
+button:disabled{opacity:.45;cursor:default}
+button.p{background:var(--acc);color:#fff;border-color:var(--acc)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:16px;margin-bottom:14px}
+.row{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px dashed var(--line)}
+.row:last-child{border:0}
+.k{color:var(--dim)}
+.big{font-size:22px;font-weight:600}
+.tier{display:inline-block;padding:2px 10px;border-radius:99px;font-size:12px;font-weight:600}
+.t0,.t1{background:color-mix(in srgb,var(--g) 18%,transparent);color:var(--g)}
+.t2,.t3{background:color-mix(in srgb,var(--dim) 18%,transparent);color:var(--dim)}
+.t4,.t5,.t6{background:color-mix(in srgb,var(--r) 18%,transparent);color:var(--r)}
+.g{color:var(--g)}.r{color:var(--r)}.y{color:var(--y)}.dim{color:var(--dim)}
+.bands{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:12px 0}
+.band{text-align:center;padding:10px;border:1px solid var(--line);border-radius:6px}
+.band b{display:block;font-size:17px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td,th{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left}
+th{color:var(--dim);font-weight:500}
+.scroll{overflow-x:auto}
+ul{margin:6px 0;padding-left:20px}li{margin:3px 0}
+.err{color:var(--r)}
+
+/* ── 四阶段进度条 ───────────────────────────────────── */
+.prog{display:none;background:var(--card);border:1px solid var(--line);border-radius:8px;
+      padding:14px 16px;margin-bottom:14px}
+.prog.on{display:block}
+.steps{display:flex;align-items:flex-start;gap:0}
+.step{flex:1;text-align:center;position:relative;min-width:0}
+.step::before{content:"";position:absolute;top:9px;left:-50%;width:100%;height:2px;
+      background:var(--line)}
+.step:first-child::before{display:none}
+.step.done::before,.step.now::before{background:var(--acc)}
+.dot{width:20px;height:20px;border-radius:99px;border:2px solid var(--line);background:var(--card);
+     margin:0 auto 6px;position:relative;z-index:1;font-size:11px;line-height:16px;color:var(--dim)}
+.step.done .dot{background:var(--acc);border-color:var(--acc);color:#fff}
+.step.now .dot{border-color:var(--acc);color:var(--acc);
+     animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+.step .nm{font-size:12px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.step.now .nm,.step.done .nm{color:var(--fg)}
+.step .sub2{font-size:11px;color:var(--dim);min-height:15px}
+.progfoot{display:flex;justify-content:space-between;gap:10px;margin-top:10px;
+     padding-top:10px;border-top:1px dashed var(--line);font-size:12px;color:var(--dim)}
+.progfoot .now{color:var(--fg)}
+
+/* ── Top10 折叠卡片 ─────────────────────────────────── */
+details.pick{border-bottom:1px solid var(--line)}
+details.pick:last-child{border-bottom:0}
+details.pick>summary{list-style:none;cursor:pointer;padding:12px 0;display:flex;
+     justify-content:space-between;align-items:flex-start;gap:12px}
+details.pick>summary::-webkit-details-marker{display:none}
+details.pick>summary:hover .nm2{color:var(--acc)}
+.pickL{min-width:0;flex:1}
+.nm2{font-weight:600}
+.pickR{text-align:right;white-space:nowrap;font-size:13px}
+.one{color:var(--dim);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+     margin-top:2px}
+details.pick[open] .one{display:none}
+.caret{color:var(--dim);font-size:11px;margin-left:6px}
+details.pick[open] .caret{transform:rotate(90deg);display:inline-block}
+.body{padding:0 0 14px}
+.dd{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--dim);margin:8px 0}
+/* ── 历史 Timeline ──────────────────────────────────── */
+details.hist{background:var(--card);border:1px solid var(--line);border-radius:8px;margin-bottom:14px}
+details.hist>summary{list-style:none;cursor:pointer;padding:11px 16px;font-size:13px;color:var(--dim)}
+details.hist>summary::-webkit-details-marker{display:none}
+details.hist>summary:hover{color:var(--fg)}
+details.hist[open]>summary{border-bottom:1px solid var(--line)}
+.tl{padding:4px 0}
+.tlrow{display:flex;align-items:baseline;gap:10px;padding:8px 16px;cursor:pointer;font-size:13px}
+.tlrow:hover{background:color-mix(in srgb,var(--acc) 8%,transparent)}
+.tlday{color:var(--dim);font-variant-numeric:tabular-nums;white-space:nowrap;min-width:44px}
+.tlico{width:16px;text-align:center}
+.tlmain{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tlsub{color:var(--dim);font-size:12px;white-space:nowrap}
+.star{cursor:pointer;font-size:14px;line-height:1;padding:0 2px;color:var(--dim);flex:0 0 auto}
+.star.on{color:var(--acc)}
+.star:hover{color:var(--acc)}
+details.cb{margin:6px 0}
+details.cb>summary{list-style:none;cursor:pointer;color:var(--dim);font-size:12px}
+details.cb>summary::-webkit-details-marker{display:none}
+details.cb>summary:hover{color:var(--acc)}
+.cpick{padding:6px 0 6px 12px;border-left:2px solid var(--line);margin:6px 0;font-size:12px}
+.cpick b{font-weight:600}
+.cnote{font-size:12px;color:var(--dim);margin:4px 0 8px;padding-left:2px}
+.tlhead{padding:8px 16px 2px;font-size:12px;color:var(--dim);border-top:1px dashed var(--line)}
+.tlhead:first-child{border-top:0}
+@media(max-width:560px){.tlsub{display:none}}
+
+@media(max-width:560px){
+  .bands{grid-template-columns:1fr}
+  .step .nm{font-size:11px}
+  .step .sub2{font-size:10px}
+  details.pick>summary{flex-direction:column;gap:4px}
+  .pickR{text-align:left}
+}
+</style>
+</head>
+<body><div class="wrap">
+<h1>低估价值挖掘系统</h1>
+<div class="sub">机械层收集信息，模型层做判断</div>
+
+<div class="bar">
+  <div class="qwrap">
+    <input id="q" placeholder="股票代码或名称，如 600519 / 贵州茅台 / UNH" autocomplete="off">
+    <div class="suggest" id="suggest"></div>
+  </div>
+  <button class="p" id="bAnalyze" onclick="analyze()">分析</button>
+  <button id="bCn" onclick="mine('cn')">挖掘 A股</button>
+  <button id="bUs" onclick="mine('us')">挖掘 美股</button>
+</div>
+
+<details class="hist" id="watch">
+  <summary id="watchsum">自选池（…）</summary>
+  <div class="wadd">
+    <input id="wq" placeholder="代码或名称，如 600519 / 联合健康" autocomplete="off">
+    <button id="bwAdd" onclick="watchAdd()">+ 自选</button>
+  </div>
+  <div class="wmsg" id="wmsg"></div>
+  <div class="tl" id="wl"></div>
+</details>
+
+<details class="hist" id="hist">
+  <summary id="histsum">历史记录</summary>
+  <div class="tl" id="tl"></div>
+</details>
+
+<div class="prog" id="prog">
+  <div class="steps" id="steps"></div>
+  <div class="progfoot">
+    <span class="now" id="pnow"></span>
+    <span id="ptime"></span>
+  </div>
+</div>
+
+<div class="stage err" id="stage"></div>
+<div id="out"></div>
+
+<script>
+const $=s=>document.querySelector(s), out=$('#out'), stage=$('#stage');
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const n=(v,d=2)=>v==null||!isFinite(v)?'—':Number(v).toFixed(d);
+const pct=(v,d=0)=>v==null||!isFinite(v)?'—':(v*100).toFixed(d)+'%';
+
+// ── 四阶段进度条 ───────────────────────────────────────
+const PHASES=['收集','粗筛','补数','裁决'];
+let timer=null, t0=0, cur={phase:0,text:'',done:null,total:null};
+
+function drawSteps(){
+  $('#steps').innerHTML=PHASES.map((nm,i)=>{
+    const ph=i+1;
+    const cls=ph<cur.phase?'done':ph===cur.phase?'now':'';
+    const mark=ph<cur.phase?'✓':ph;
+    const sub=ph===cur.phase&&cur.total?`${cur.done??0}/${cur.total}`:'';
+    return `<div class="step ${cls}"><div class="dot">${mark}</div>
+      <div class="nm">${nm}</div><div class="sub2">${sub}</div></div>`;
+  }).join('');
+}
+function startProg(){
+  cur={phase:0,text:'',done:null,total:null};
+  t0=Date.now(); $('#prog').classList.add('on'); drawSteps();
+  clearInterval(timer);
+  timer=setInterval(()=>{
+    const s=Math.floor((Date.now()-t0)/1000);
+    $('#ptime').textContent=`${String(Math.floor(s/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;
+  },1000);
+}
+function onStage(d){
+  if(d.phase) cur={phase:d.phase,text:d.text||'',done:d.done,total:d.total};
+  else cur.text=d.text||cur.text;
+  drawSteps();
+  $('#pnow').textContent=cur.text;
+}
+function endProg(ok){
+  clearInterval(timer); timer=null;
+  if(ok){ cur.phase=PHASES.length+1; drawSteps(); $('#pnow').textContent='完成'; }
+}
+function busy(b){ ['bAnalyze','bCn','bUs'].forEach(id=>$('#'+id).disabled=b); }
+
+function sse(url,handlers,{progress=false}={}){
+  out.innerHTML=''; stage.textContent=''; busy(true);
+  if(progress) startProg(); else $('#prog').classList.remove('on');
+  const es=new EventSource(url);
+  for(const [k,fn] of Object.entries(handlers)) es.addEventListener(k,e=>fn(JSON.parse(e.data)));
+  es.addEventListener('stage',e=>{const d=JSON.parse(e.data);
+    if(progress) onStage(d); else stage.textContent=d.text||'';});
+  es.addEventListener('error',e=>{
+    let m='连接中断'; try{m=JSON.parse(e.data).message}catch{}
+    stage.textContent=m; endProg(false); busy(false); es.close();
+  });
+  es.addEventListener('done',()=>{endProg(progress); busy(false); es.close(); loadHist();});
+  return es;
+}
+
+// ── 历史 Timeline ──────────────────────────────────────
+let HIST=[];
+async function loadHist(){
+  try{
+    const {items}=await (await fetch('/api/history')).json();
+    HIST=items||[];
+  }catch{HIST=[]}
+  renderTl();
+}
+
+function renderTl(){
+  $('#histsum').textContent=HIST.length?`历史记录（${HIST.length}）`:'历史记录（暂无）';
+  if(!HIST.length){$('#tl').innerHTML='<div class="tlrow dim">还没有记录。挖掘或分析完成后会自动存入。</div>';return}
+  let lastDay='';
+  $('#tl').innerHTML=HIST.map((x,i)=>{
+    const day=(x.date||'').slice(5)||'—';
+    const head=day!==lastDay?(lastDay=day,`<div class="tlhead">${esc(x.date||'')}</div>`):'';
+    // 星标只在同组多于一条时出现——单条记录没什么可选的
+    const star=x.groupCount>1
+      ? `<span class="star ${x.keep?'on':''}" title="${x.keep?'已标记保留':'标记保留这一次'}"
+           onclick="event.stopPropagation();keepHist('${esc(x.file)}')">${x.keep?'★':'☆'}</span>`
+      : '';
+    if(x.kind==='mine'){
+      return head+`<div class="tlrow" onclick="openHist(${i})">
+        <span class="tlday">${day}</span><span class="tlico">⛏</span>
+        <span class="tlmain">${x.market==='cn'?'A股':'美股'}挖掘 · Top${x.top}</span>
+        <span class="tlsub">${x.totalMs?Math.round(x.totalMs/1000)+'s':''}${x.modelCalls?' · '+x.modelCalls+'次调用':''}</span>
+        ${star}
+      </div>`;
+    }
+    const bits=[x.tier,x.mos!=null?'安全边际 '+pct(x.mos):null,x.attribution].filter(Boolean).join(' · ');
+    return head+`<div class="tlrow" onclick="openHist(${i})">
+      <span class="tlday">${day}</span><span class="tlico">${x.isTrap?'⚠':'📊'}</span>
+      <span class="tlmain">${esc(x.name||x.code)} <span class="dim">${esc(x.code||'')}</span></span>
+      <span class="tlsub">${esc(bits)}${x.hasLlm?'':' · 仅机械层'}</span>
+      ${star}
+    </div>`;
+  }).join('');
+}
+
+async function keepHist(file){
+  try{
+    const r=await fetch('/api/history/keep',{method:'POST',
+      headers:{'content-type':'application/json'},body:JSON.stringify({file})});
+    const d=await r.json();
+    if(d.items){HIST=d.items;renderTl();}
+  }catch{}
+}
+
+async function openHist(i){
+  const it=HIST[i]; if(!it)return;
+  stage.textContent=''; $('#prog').classList.remove('on');
+  out.innerHTML='<div class="card dim">读取记录…</div>';
+  try{
+    const d=await (await fetch('/api/history/'+encodeURIComponent(it.file))).json();
+    if(d.error){out.innerHTML='<div class="card err">'+esc(d.error)+'</div>';return}
+    const when=new Date(d.at||it.at).toLocaleString('zh-CN');
+    if(it.kind==='stock'||d.kind==='stock'){
+      out.innerHTML=`<div class="card dim">历史记录 · ${esc(when)} · 单股分析${d.attribution?.ok?'':' · 仅机械层'}</div>`;
+      out.insertAdjacentHTML('beforeend',renderMech(d.result));
+      if(d.attribution) out.insertAdjacentHTML('beforeend',renderAttr(d.attribution));
+    }else{
+      // 快照存 candidates，SSE 推 profiles，字段也更少——在此对齐
+      const profiles=(d.candidates||[]).map(c=>({...c,market:d.market,
+        tier:typeof c.tier==='string'?{name:c.tier}:c.tier,
+        band:c.pv!=null?{ok:true,pv:c.pv}:null}));
+      out.innerHTML=`<div class="card dim">历史记录 · ${esc(when)} · ${d.market==='cn'?'A股':'美股'}挖掘${d.model?' · '+esc(d.model):''}${d.totalMs?' · '+Math.round(d.totalMs/1000)+'s':''}</div>`;
+      if(d.meta)out.insertAdjacentHTML('beforeend',renderCollected(d.meta,d.watch));
+      if((d.coarse||[]).length)out.insertAdjacentHTML('beforeend',
+        renderCoarse({calls:d.modelCalls?d.modelCalls-1:d.coarse.length,
+          picks:(d.candidates||[]).filter(c=>!c.isWatch).length,batches:d.coarse}));
+      out.insertAdjacentHTML('beforeend',renderTop({verdict:{ok:true,top:d.top||[],note:d.note,
+        rejected:d.rejected||[],quotas:d.quotas||null},watch:d.watch,profiles}));
+    }
+  }catch{out.innerHTML='<div class="card err">记录读取失败</div>'}
+}
+
+// ── 联想搜索 ──────────────────────────────────────────────
+let sugList=[], sugIdx=-1, sugTimer=null, selectedCode=null;
+const sugEl=$('#suggest'), qEl=$('#q');
+
+qEl.addEventListener('input',()=>{
+  selectedCode=null; // 用户重新输入时取消已选
+  clearTimeout(sugTimer);
+  const v=qEl.value.trim();
+  if(!v){sugEl.classList.remove('on');return}
+  sugTimer=setTimeout(async()=>{
+    try{
+      const {items}=await (await fetch('/api/search?q='+encodeURIComponent(v))).json();
+      sugList=items||[]; sugIdx=-1;
+      if(!sugList.length){sugEl.classList.remove('on');return}
+      renderSug();
+      sugEl.classList.add('on');
+    }catch{sugEl.classList.remove('on')}
+  },200);
+});
+
+function renderSug(){
+  sugEl.innerHTML=sugList.map((r,i)=>{
+    const mk=r.market==='cn'?'A股':'美股';
+    const tag=r.isFund?'<span class="sug-tag">ETF·无基本面数据</span>':'';
+    const inPool=WATCH.some(w=>String(w.code).toUpperCase()===String(r.code).toUpperCase());
+    const add=inPool||r.isFund
+      ?`<span class="sug-add" style="color:var(--dim)">${inPool?'已自选':'ETF'}</span>`
+      :`<span class="sug-add" onclick="event.stopPropagation();sugAdd(${i})">＋自选</span>`;
+    const hi=i===sugIdx?' hi':'';
+    return `<div class="sug-item${hi}" data-i="${i}" data-code="${esc(r.code)}">
+      <span class="sug-code">${esc(r.code)}</span>
+      <span class="sug-name">${esc(r.name)}</span>
+      <span class="sug-mk">${mk}</span>
+      ${tag}
+      ${add}
+    </div>`;
+  }).join('');
+}
+
+sugEl.addEventListener('click',e=>{
+  const item=e.target.closest('.sug-item'); if(!item) return;
+  pickSug(Number(item.dataset.i));
+});
+sugEl.addEventListener('mouseover',e=>{
+  const item=e.target.closest('.sug-item'); if(!item) return;
+  sugIdx=Number(item.dataset.i); renderSug();
+});
+
+function pickSug(i){
+  const r=sugList[i]; if(!r) return;
+  selectedCode=r.code;
+  qEl.value=r.code+' '+r.name;
+  sugEl.classList.remove('on');
+  analyze();
+}
+
+qEl.addEventListener('keydown',e=>{
+  const open=sugEl.classList.contains('on');
+  if(!open) return;
+  if(e.key==='ArrowDown'){e.preventDefault();sugIdx=Math.min(sugIdx+1,sugList.length-1);renderSug()}
+  else if(e.key==='ArrowUp'){e.preventDefault();sugIdx=Math.max(sugIdx-1,0);renderSug()}
+  else if(e.key==='Enter'&&sugIdx>=0){e.preventDefault();pickSug(sugIdx)}
+  else if(e.key==='Escape'){sugEl.classList.remove('on');sugIdx=-1}
+});
+
+// ── 自选池 ───────────────────────────────────────────────
+// 纯手动进出：挖掘时池内票跳过粗筛直通深度补数，最多占 Top 一半席位。
+let WATCH=[], WATCH_HINT=10;
+async function loadWatch(){
+  try{
+    const d=await (await fetch('/api/watchlist')).json();
+    WATCH=d.items||[]; WATCH_HINT=d.sizeHint||WATCH_HINT;
+  }catch{WATCH=[]}
+  renderWatch();
+}
+function renderWatch(){
+  const n=WATCH.length, cn=WATCH.filter(x=>x.market==='cn').length;
+  $('#watchsum').textContent=n?`自选池（${n}）· A股 ${cn} · 美股 ${n-cn}`:'自选池（空）';
+  if(!n){
+    $('#wl').innerHTML='<div class="tlrow dim">搜索框联想里点「＋自选」，或在上方输入代码加入。挖掘时市场独占 Top 10。</div>';
+    return;
+  }
+  $('#wl').innerHTML=WATCH.map((x,i)=>`<div class="wrow">
+    <span class="sug-code">${esc(x.code)}</span>
+    <span class="tlmain">${esc(x.name)}</span>
+    <span class="sug-mk">${x.market==='cn'?'A股':'美股'}</span>
+    <span class="ind">${esc(x.industry||'')}</span>
+    <span class="wx" title="移出自选池" onclick="watchRemove(${i})">✕</span>
+  </div>`).join('');
+  if(n>WATCH_HINT)$('#wl').insertAdjacentHTML('beforeend',
+    `<div class="whint">⚠ 池子超过 ${WATCH_HINT} 只：每轮挖掘的阶段3会逐股补数（含新闻检索），耗时随池子线性增加</div>`);
+}
+async function watchAdd(){
+  const q=$('#wq').value.trim(); if(!q)return;
+  $('#wmsg').textContent='解析中…';
+  const d=await postWatch('/api/watchlist/add',{q});
+  if(d.error){$('#wmsg').textContent=d.error;return}
+  $('#wmsg').textContent=`已在自选池：${d.entry.name}（${d.entry.code}）`;
+  $('#wq').value='';
+  WATCH=d.items||WATCH; renderWatch();
+}
+async function watchRemove(i){
+  const x=WATCH[i]; if(!x)return;
+  const d=await postWatch('/api/watchlist/remove',{code:x.code});
+  if(d.items){WATCH=d.items;renderWatch()}
+  $('#wmsg').textContent=`已移出：${x.name}`;
+}
+async function sugAdd(i){
+  const r=sugList[i]; if(!r)return;
+  const d=await postWatch('/api/watchlist/add',{q:r.code});
+  if(d.items){WATCH=d.items;renderWatch()}
+  $('#wmsg').textContent=d.error||`已在自选池：${d.entry.name}（${d.entry.code}）`;
+}
+async function postWatch(url,body){
+  try{
+    const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify(body)});
+    return await r.json();
+  }catch{return {error:'请求失败'}}
+}
+$('#wq').addEventListener('keydown',e=>{if(e.key==='Enter')watchAdd()});
+document.addEventListener('click',e=>{if(!e.target.closest('.qwrap'))sugEl.classList.remove('on')});
+loadWatch();
+
+// ── 挖掘 / 单股 ────────────────────────────────────────
+function analyze(){
+  sugEl.classList.remove('on');
+  const q=selectedCode||$('#q').value.trim(); if(!q)return;
+  sse('/api/analyze?q='+encodeURIComponent(q),{
+    mechanical:r=>out.innerHTML=renderMech(r),
+    attribution:a=>out.insertAdjacentHTML('beforeend',renderAttr(a)),
+  });
+}
+function mine(m){
+  sse('/api/mine?market='+m,{
+    collected:d=>out.innerHTML=renderCollected(d.meta,d.watch),
+    coarse:d=>out.insertAdjacentHTML('beforeend',renderCoarse(d)),
+    verdict:d=>out.insertAdjacentHTML('beforeend',renderTop(d)),
+  },{progress:true});
+}
+
+function renderCollected(m,w){
+  const wRow=w&&w.pool?`<div class="row"><span class="k">自选池</span>
+    <span>${w.joined}/${w.pool} 只并入（挖掘时最多占 Top 一半席位${w.missing&&w.missing.length?'；未找到：'+esc(w.missing.join('、')):''}）</span></div>`:'';
+  return `<div class="card"><b>阶段1 · 全市场信息收集</b>
+    <div class="row"><span class="k">全市场</span><span>${m.universe} 只</span></div>
+    <div class="row"><span class="k">池子范围内</span><span>${m.pool} 只</span></div>
+    ${wRow}
+    <div class="row"><span class="k">耗时</span><span>${(m.elapsedMs/1000).toFixed(0)}s</span></div>
+    ${(m.caveats||[]).length?'<div class="dim" style="margin-top:8px">已知字段缺口：<ul>'+m.caveats.map(c=>'<li>'+esc(c)+'</li>').join('')+'</ul></div>':''}
+  </div>`;
+}
+function renderCoarse(d){
+  let s=`<div class="card"><b>阶段2 · 模型粗筛</b> <span class="dim">${d.calls??(d.batches||[]).length} 次调用 → 入围 ${d.picks??(d.batches||[]).reduce((a,b)=>a+(b.picked??(b.picks||[]).length),0)} 只</span>
+    <div class="scroll"><table>`;
+  (d.batches||[]).forEach(b=>{
+    const cnt=b.picked??(b.picks||[]).length;
+    s+=`<tr><td>${esc(b.label||b.bucket)}</td><td style="text-align:right">${b.scanned??'—'}</td>
+      <td style="text-align:right">${b.ok!==false?'→ '+cnt:'<span class="r">✗</span>'}</td></tr>`;
+  });
+  s+='</table></div>';
+  // 每批的整体观察与逐只推理——此前存了却从不展示
+  (d.batches||[]).forEach(b=>{
+    const picks=b.picks||[];
+    const rich=picks.length&&typeof picks[0]==='object';
+    if(!b.note&&!rich)return;
+    s+=`<details class="cb"><summary>${esc(b.label||b.bucket)} · 粗筛思路${rich?`（${picks.length} 只）`:''} ▾</summary>`;
+    if(b.note)s+=`<div class="cnote">${esc(b.note)}</div>`;
+    if(rich)picks.forEach(p=>{
+      s+=`<div class="cpick"><b>${esc(p.name||p.code)}</b> <span class="dim">${esc(p.code||'')}</span>
+        ${p.guess?' <span class="tier '+ATTR_CLS(p.guess)+'">'+esc(p.guess)+'</span>':''}
+        ${p.why?'<div>'+esc(p.why)+'</div>':''}
+        ${p.checkNext?'<div class="dim">待验证：'+esc(p.checkNext)+'</div>':''}</div>`;
+    });
+    s+='</details>';
+  });
+  return s+'</div>';
+}
+
+// 归因类别 → 配色。注意不能用估值档位的 tier.index：归因与档位是两回事。
+const ATTR_CLS=a=>/结构性衰退|商业模式证伪/.test(a||'')?'t5'
+  :/治理折价/.test(a||'')?'t3'
+  :/周期性底部|一次性事件|情绪杀|流动性/.test(a||'')?'t0':'t2';
+
+function renderTop(d){
+  const v=d.verdict;
+  if(!v||!v.ok) return '<div class="card y">裁决不可用：'+esc(v&&v.reason||'')+'</div>';
+  const by={}; (d.profiles||[]).forEach(p=>by[String(p.code).toUpperCase()]=p);
+  // 自选参与的运行才展示分组信息；纯市场运行保持原有形态
+  const hasGroup=!!(v.quotas&&v.quotas.watchCandidates>0);
+  let s=`<div class="card"><b>Top ${v.top.length}</b>`
+    +(hasGroup?` <span class="dim">自选组 ≤${v.quotas.watch} + 市场组 ≤${v.quotas.market}，互不补位；第一名默认展开</span>`
+             :' <span class="dim">第一名默认展开，其余点击查看</span>');
+  v.top.forEach((x,i)=>{
+    const p=by[String(x.code).toUpperCase()]||{};
+    const cur2=p.market==='cn'?'¥':'$';
+    const mos=p.band&&p.band.pv!=null?pct(1-p.band.pv):'—';
+    const dd=p.drawdowns||{};
+    const first=String(x.thesis||'').split(/(?<=[。！？])/)[0]||'';
+    const grp=hasGroup?(x.group==='自选'?'<span class="grp grpW">自选</span>':'<span class="grp grpM">市场</span>'):'';
+    s+=`<details class="pick"${i===0?' open':''}>
+      <summary>
+        <div class="pickL">
+          <span class="nm2">${x.rank}. ${esc(p.name||x.code)} ${grp}</span>
+          <span class="dim"> ${esc(x.code)} · ${esc(p.industry||'')}</span>
+          <span class="caret">▶</span>
+          <div class="one">${esc(first)}</div>
+        </div>
+        <div class="pickR">
+          <div>${cur2}${n(p.price)}</div>
+          <div><span class="tier ${ATTR_CLS(x.attribution)}">${esc(x.attribution||'')}</span></div>
+          <div class="dim">安全边际 ${mos}</div>
+        </div>
+      </summary>
+      <div class="body">
+        <p>${esc(x.thesis)}</p>
+        <div class="dd">
+          <span>13周 ${pct(dd.dd13w)}</span><span>26周 ${pct(dd.dd26w)}</span>
+          <span>52周 ${pct(dd.dd52w)}</span><span>3年 ${pct(dd.dd3y)}</span><span>5年 ${pct(dd.dd5y)}</span>
+        </div>
+        ${p.tier?.name?`<div class="dim">估值档位 ${esc(p.tier.name)}${p.fScore!=null?' · F-Score '+p.fScore:''}</div>`:''}
+        ${x.catalyst?'<div class="dim">催化剂：'+esc(x.catalyst)+'</div>':''}
+        ${(x.risks||[]).length?'<div class="dim">关键风险：<ul>'+x.risks.map(r=>'<li>'+esc(r)+'</li>').join('')+'</ul></div>':''}
+        ${(x.killCriteria||[]).length?'<div class="y">否决条件（满足即结论作废）：<ul>'+x.killCriteria.map(k=>'<li>'+esc(k)+'</li>').join('')+'</ul></div>':''}
+        ${x.valuationCaveat?'<div class="y">⚠ 估值提醒：'+esc(x.valuationCaveat)+'</div>':''}
+      </div>
+    </details>`;
+  });
+  // 自选池落选区：池内票没进 Top 的逐只给原因，判为陷阱的提示建议移出（不代删）
+  if(hasGroup){
+    const wr=(v.rejected||[]).filter(x=>x.group==='自选');
+    if(wr.length){
+      s+=`<div style="margin-top:12px;padding-top:12px;border-top:1px dashed var(--line)"><b class="dim">自选池落选（${wr.length}）</b>`
+        +wr.map(x=>{
+          const p=by[String(x.code).toUpperCase()]||{};
+          const trap=/结构性衰退|商业模式证伪|陷阱/.test(x.why||'');
+          return `<div style="margin:4px 0;font-size:13px">${esc(p.name||x.code)} <span class="dim">${esc(x.code)}</span> — ${esc(x.why||'')}${trap?' <span class="y">← 建议移出（仅手动）</span>':''}</div>`;
+        }).join('')+'</div>';
+    }
+  }
+  // 补数失败提示不设 hasGroup 门控：失败时 profiles 里没有该票，
+  // 配额区看不到它，门控内提示会静默吞掉「用户加了票却消失」这件事
+  if(d.watch&&d.watch.failed&&d.watch.failed.length)
+    s+=`<div class="y">⚠ 自选池补数失败：${esc(d.watch.failed.join('、'))}</div>`;
+  if(v.note)s+='<div class="dim" style="margin-top:12px;padding-top:12px;border-top:1px dashed var(--line)">整体判断：'+esc(v.note)+'</div>';
+  if(v.suspectNumbers&&v.suspectNumbers.length)
+    s+='<div class="y">⚠ 以下数字无法追溯到输入数据，请自行核实：'+esc(v.suspectNumbers.map(x=>x.value).join('、'))+'</div>';
+  return s+'</div>';
+}
+
+function renderMech(r){
+  const s=r.stock, u=s.market==='cn'?'¥':'$', b=r.band;
+  let h=`<div class="card"><div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
+    <div><div class="big">${esc(s.name)} <span class="dim" style="font-size:14px">${esc(s.code)}</span></div>
+    <div class="dim">${esc(s.industry||'')} · ${s.market==='cn'?'A股':'美股'}</div></div>
+    <div style="text-align:right"><div class="big">${u}${n(r.price)}</div>
+    <div class="dim">置信度 ${esc(r.confidence.level)} ${r.confidence.score}</div></div></div>`;
+  if(b&&b.ok){
+    h+=`<div class="bands">
+      <div class="band"><span class="dim">保守</span><b>${u}${n(b.conservative,0)}</b></div>
+      <div class="band"><span class="dim">中性</span><b>${u}${n(b.neutral,0)}</b></div>
+      <div class="band"><span class="dim">乐观</span><b>${u}${n(b.optimistic,0)}</b></div></div>
+      <div class="row"><span class="k">综合判定</span><span class="tier t${r.tier.index}">${esc(r.tier.name)}</span></div>
+      <div class="row"><span class="k">P/V 比值</span><span>${n(b.pv,3)}</span></div>
+      <div class="row"><span class="k">相对保守档</span><span>${n(b.vsConservative*100,1)}%</span></div>
+      <div class="row"><span class="k">估值口径</span><span class="dim">${esc(r.route.reason)}</span></div>
+      <div class="row"><span class="k">分位 P25/P50/P75</span><span>${n(r.percentiles.p25,1)} / ${n(r.percentiles.p50,1)} / ${n(r.percentiles.p75,1)} <span class="dim">（${n(r.percentiles.years,1)}年 ${r.percentiles.n}点）</span></span></div>`;
+    if(r.tierCapped)h+=`<div class="y" style="margin-top:8px">⚠ 档位被压制：多视角未达成一致</div>`;
+  }else h+=`<div class="y">估值区间不可得：${esc(b&&b.reason||'')}</div>`;
+  h+=`</div><div class="card"><b>多视角交叉校验</b> <span class="dim">印证区间 ${r.bandAgreement.agree}/${r.bandAgreement.valid}</span>`;
+  const nm={selfHistory:'自身历史',peers:'同业横截面',earningsQuality:'盈利质量',roePb:'资产回报匹配',cashYield:'现金回报'};
+  const vc={undervalued:'<span class="g">低估</span>',fair:'<span class="dim">合理</span>',overvalued:'<span class="r">高估</span>',na:'<span class="dim">不可得</span>'};
+  for(const [k,v] of Object.entries(r.views))
+    h+=`<div class="row"><span class="k">${nm[k]||k} ${vc[v.verdict]}</span><span class="dim">${esc(v.detail)}</span></div>`;
+  if(r.cross.conflict)h+=`<div class="y" style="margin-top:8px">⚠ ${esc(r.cross.conflict)}</div>`;
+  h+=`</div><div class="card"><b>质量指标</b> <span class="dim">仅供参考，不作为淘汰依据</span>
+    ${r.fScore!=null?`<div class="row"><span class="k">F-Score</span><span>${r.fScore}/9</span></div>`:''}`;
+  (r.quality.failures||[]).forEach(f=>h+=`<div class="dim">· ${esc(f)}</div>`);
+  if(r.mos.actual!=null)h+=`<div class="row"><span class="k">安全边际</span><span>实际 ${n(r.mos.actual*100,0)}% / 参考 ${n(r.mos.required*100,0)}%</span></div>`;
+  h+=`<div class="dim" style="margin-top:10px;font-size:12px">数据来源：${esc(r.series.source)}（${r.series.points} 点）· 字段覆盖 ${n(r.coverage.ratio*100,0)}%</div></div>`;
+  return h;
+}
+function renderAttr(a){
+  if(!a||!a.ok)return `<div class="card y">定性分析不可用：${esc(a&&a.reason||'')}</div>`;
+  let h=`<div class="card"><b>下跌归因</b> <span class="tier ${ATTR_CLS(a.category)}">${esc(a.category)}${a.isTrap?' · 价值陷阱':''}</span>
+    <p>${esc(a.summary)}</p>`;
+  const list=(t,arr,cls='')=>arr&&arr.length?`<div class="${cls}"><b>${t}</b><ul>${arr.map(x=>`<li>${esc(x)}</li>`).join('')}</ul></div>`:'';
+  h+=list('证据',a.evidence);
+  h+=list('否决条件（满足即结论作废）',a.killCriteria,'y');
+  h+=list('关键风险',a.risks);
+  h+=`<div class="dim">催化剂：${esc((a.catalysts||[]).join('；')||'无可见催化剂 —— 需要耐心')}</div>`;
+  if(a.categoryUnmatched)h+=`<div class="y">⚠ 归因类别「${esc(a.categoryRaw)}」不在标准六类内，已原样保留</div>`;
+  if(a.suspectNumbers&&a.suspectNumbers.length)
+    h+=`<div class="y">⚠ 以下数字无法追溯到输入数据，请自行核实：${esc(a.suspectNumbers.map(x=>x.value).join('、'))}</div>`;
+  h+=`<div class="dim" style="font-size:12px;margin-top:10px">定性结论由 ${esc(a.model||'模型')} 生成，仅供研究参考，不构成投资建议</div></div>`;
+  return h;
+}
+
+loadHist();
+</script>
+</div></body></html>

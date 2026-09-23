@@ -1,0 +1,7 @@
+.cache/
+.run/
+reports/
+snapshots/
+coverage/
+.DS_Store
+watchlist.json
