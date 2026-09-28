@@ -1,6 +1,7 @@
 // 阶段 3 · 深度补数（SYSTEM_DEFINITION §3 新架构）。
 // 仅对粗筛入围的 ≤47 只执行。此阶段仍**不做任何淘汰**，只把信息补厚。
 import * as val from './valuation.js';
+import { requiredMos } from './valuation.js';
 import { adjustedMonthly, drawdowns, renderCoverage } from './metrics/returns.js';
 import { normalizedEarnings, fundamentalHistory, quarterlyHistory } from './metrics/normalize.js';
 import { isFinancial } from './classify.js';
@@ -184,7 +185,11 @@ export function renderProfile(p, i) {
       : p.drawdown52Daily?.rejected != null ? `｜行情接口距52周最高价 ${pc(p.drawdown52Daily.rejected)} 与月线口径差异过大（疑似未复权），未采用` : ''));
   L.push(`区间收益：13周 ${pc(d.ret13w)}　26周 ${pc(d.ret26w)}　52周 ${pc(d.ret52w)}　3年 ${pc(d.ret3y)}　5年 ${pc(d.ret5y)}`);
 
-  L.push(`基本面：ROE ${f(p.roe, 1)}%（5年中位 ${f(p.roeMedian5, 1)}%）　毛利率 ${f(p.grossMargin, 1)}%　负债率 ${f(p.debtRatio, 1)}%　F-Score ${p.fScore ?? '—'}`);
+  // F-Score 同时给出对应的参考安全边际（v0.11.3 批 C1）：榜单提示词里的达标门槛按它分档，
+  // 模型要判「达标」就得能看到这个门槛，否则只能自由心证
+  const reqMos = p.fScore != null ? requiredMos(p.fScore) : null;
+  L.push(`基本面：ROE ${f(p.roe, 1)}%（5年中位 ${f(p.roeMedian5, 1)}%）　毛利率 ${f(p.grossMargin, 1)}%　负债率 ${f(p.debtRatio, 1)}%`
+    + `　F-Score ${p.fScore ?? '—'}${reqMos != null ? `（F-Score ${p.fScore} 对应的参考安全边际 ${(reqMos * 100).toFixed(0)}%）` : ''}`);
   L.push(`　　　　营收CAGR ${pc(p.revenueCagr)}　累计FCF/净利 ${f(p.cumFcfToProfit)}`
     + `${p.cumFcfYears && p.fundamentals?.years?.length && p.cumFcfYears < p.fundamentals.years.length ? `（仅 ${p.cumFcfYears} 年配对得上）` : ''}`
     + `　ROIC ${f(p.roic, 1)}%　利息保障 ${f(p.interestCoverage, 1)}x`);

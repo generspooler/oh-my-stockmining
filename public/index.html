@@ -686,8 +686,13 @@ const webOf=(r,code)=>((r&&r.findings)||[]).find(f=>String(f.code).toUpperCase()
 const safeUrl=u=>/^https?:\/\//i.test(String(u||''))?esc(u):'#';
 const webRow=f=>{
   if(!f)return'';
-  const ev=(f.events||[]).map(e=>`<li>${esc(e.date||'日期不明')} · ${esc(e.source||'来源不明')} · ${esc(e.kind||'')}：${esc(e.claim||e.title||'')} <a href="${safeUrl(e.url)}" target="_blank" rel="noopener noreferrer">原文</a></li>`).join('');
-  const cf=(f.conflicts||[]).map(c=>`<li class="y">与给定数据冲突：${esc(c.claim)}${c.url?` <a href="${safeUrl(c.url)}" target="_blank" rel="noopener noreferrer">来源</a>`:''}</li>`).join('');
+  // 「仅摘要」如实标出（v0.11.3）：有链接不等于读了原文
+  const ev=(f.events||[]).map(e=>`<li>${esc(e.date||'日期不明')} · ${esc(e.source||'来源不明')} · ${esc(e.kind||'')}：${esc(e.claim||e.title||'')}${e.read==='snippet'?' <span class="dim">（仅搜索摘要）</span>':''} <a href="${safeUrl(e.url)}" target="_blank" rel="noopener noreferrer">原文</a></li>`).join('');
+  // 冲突分两类（v0.11.3）：与事实清单对不上（常是口径差异）vs 网页之间互相矛盾
+  const cf=(f.conflicts||[]).map(c=>{
+    const tag=c.against==='web'?'网页之间互相矛盾':'与事实清单对不上';
+    return `<li class="y">${tag}：${esc(c.claim)}${c.detail?`——${esc(c.detail)}`:''}${c.url?` <a href="${safeUrl(c.url)}" target="_blank" rel="noopener noreferrer">来源</a>`:''}</li>`;
+  }).join('');
   return `<details class="cb"><summary>▸ 联网研究（网络来源，未经本系统核实）${f.confidence?' · 研究员自评可信度 '+esc(f.confidence):''}${f.events&&f.events.length?' · '+f.events.length+' 条事件':''}</summary>
     ${f.summary?`<p class="dim">${esc(f.summary)}</p>`:''}
     ${(f.drivers||[]).length?`<div class="dim">驱动：${f.drivers.map((d,i)=>`${i+1}) ${esc(d)}`).join('；')}</div>`:''}

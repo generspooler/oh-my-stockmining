@@ -27,7 +27,10 @@ const profiles = [
 ];
 const finding = (code, extra = {}) => ({
   code, summary: `${code} 概要`, drivers: ['驱动一'], confidence: '中',
-  events: [{ date: '2026-08-06', source: 'IBD', title: 't', url: 'https://example.com/a', kind: '业绩', claim: '财报后跌 20%' }],
+  events: [{
+    date: '2026-08-06', source: 'IBD', title: 't', url: 'https://example.com/a',
+    kind: '业绩', claim: '财报后跌 20%', read: 'full',   // 读没读原文要如实标注（v0.11.3）
+  }],
   ...extra,
 });
 
@@ -114,6 +117,23 @@ test('renderResearch：失败时如实说缺这块；成功时带网络来源的
   assert.match(t, /数字只作参考/);
   assert.match(t, /交回 1\/2 只｜到时限被终止/);
   assert.match(t, /2026-08-06｜IBD｜业绩｜财报后跌 20%（https:\/\/example\.com\/a）/);
+  // 只有摘要时如实标「仅搜索摘要」（v0.11.3）：有链接 ≠ 读过原文
+  const t2 = renderResearch({
+    ok: true, model: 'm', ms: 1e3, requested: 1, findings: [normalizeFinding(finding('APP', {
+      events: [{ ...finding('APP').events[0], read: 'snippet' }],
+    }), known)], missing: [],
+  }, profiles);
+  assert.match(t2, /（仅搜索摘要）/);
+  // 冲突分两类：与事实清单对不上 / 网页之间互相矛盾
+  const t3 = renderResearch({
+    ok: true, model: 'm', ms: 1e3, requested: 1, missing: [],
+    findings: [normalizeFinding(finding('APP', {
+      conflicts: [{ claim: '回撤对不上', against: 'fact', detail: '日频 vs 月末采样' },
+        { claim: '两家说法不同', against: 'web' }],
+    }), known)],
+  }, profiles);
+  assert.match(t3, /与事实清单对不上：回撤对不上——日频 vs 月末采样/);
+  assert.match(t3, /网页之间互相矛盾：两家说法不同/);
   assert.match(t, /未交回结论：600036（招商银行）/);
 });
 

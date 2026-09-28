@@ -1,6 +1,6 @@
 {
   "name": "my-stock-mining",
-  "version": "0.11.3",
+  "version": "0.11.4",
   "private": true,
   "type": "module",
   "description": "低估价值挖掘系统：单股低估判定 + 全市场错杀低估 Top + 自选池挖掘",

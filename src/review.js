@@ -15,7 +15,7 @@
 // 「批内先筛 → 终裁只处理入围的」后，每次调用的输出量都与市场裁决相当。
 import { complete, completeWithTools, extractJson, validateNumbers, whitelistOf, dumpRaw, tickText } from './llm.js';
 import {
-  fitBoard, boardRule, BOARD_FIELDS, ANCHOR_RULE, ANCHOR_FIELDS, WEB_RULE, withValuation, normalizeExternal,
+  fitBoard, boardRule, BOARD_FIELDS, ANCHOR_FIELDS, CRITERIA, NUMBER_RULE, withValuation, normalizeExternal,
 } from './verdict.js';
 import { runResearch, renderResearch, compactResearch } from './research.js';
 import { resolveAnchor } from './valuation.js';
@@ -36,22 +36,16 @@ const REJECT_SCHEMA = `{
       "suggestRemove": false
     }`;
 
+// 自选池特有的两条（市场榜没有）+ 与市场榜共用的选择标准与数字规则。
+// v0.11.3 批 B：CRITERIA / NUMBER_RULE 改为从 verdict.js 引入，
+// 此前这里有一份几乎逐字相同的复制品，两份措辞已经开始漂移。
 const COMMON = `判断标准与全市场挖掘完全一致——不因为是用户自选就放水，也不因为他长期跟踪
 就假设他已经理解了风险。
 
-每只都附有：机械层精算的估值区间与质量指标、多区间回撤、以及最近的新闻与公告。
+每只都附有：机械层算出的估值锚与质量指标（数字由代码计算，见每项旁边的口径说明）、
+多区间回撤、以及最近的新闻与公告。
 
-选择标准，按重要性排序：
-1. **这个便宜是错杀还是陷阱** —— 最重要。结构性衰退与商业模式证伪一律不选，
-   无论多便宜
-2. **安全边际** —— 按你选定的估值锚，现价相对其 5 年中位估值的折价幅度
-3. **生意质量** —— 长期资本回报水平、竞争地位、现金流质量
-4. **价值实现路径** —— 有没有可见的催化剂。便宜且好可以便宜十年
-
-${ANCHOR_RULE}
-
-关于新闻：检索基于公司名全文匹配，已滤除 ETF 播报与同名机构，但仍可能有无关条目。
-「未检索到」不代表没有事件发生，只说明这个渠道没抓到。
+${CRITERIA}
 
 自选池特有的两条：
 - 池内标的可能**不在挖掘池范围内**（ST、流动性不足、美股金融地产等），这类行已标注。
@@ -59,18 +53,7 @@ ${ANCHOR_RULE}
 - 判为「结构性衰退」或「商业模式证伪」的，把该条 rejected 的 suggestRemove 设为 true。
   这只是**建议**——系统不会替用户删票，删不删由他决定。
 
-【关于数字与你自己的知识】分三层，别混：
-1. **上面给定的数据**与**你用工具取回的数据**——同等可信，可直接引用。
-2. **你自己的记忆与判断**——可以用，而且在两种情况下**应该**用：
-   一是给定数据看起来不对时（口径可疑、数量级离谱、与你所知的事实冲突），
-   二是需要行业常识才能解释数据时。但这类内容必须写进 externalNotes 字段，
-   并说明你为什么这么认为。系统会把它标注为「外部知识，未经本系统验证」呈现给用户。
-3. **不要**把记忆里的数字直接写进 thesis / keyData 等定量字段冒充实测值。
-   定量结论只能用第 1 层的数字；第 2 层负责提出质疑与提供背景，不负责替换数据。
-
-${WEB_RULE}
-
-**发现给定数据有问题时请明说，不要将就着用。**`;
+${NUMBER_RULE}`;
 
 const SYS = `你是深耕全球资本市场多年的资深价值投资分析师，遵循价值投资原则。
 
@@ -86,8 +69,11 @@ const SYS = `你是深耕全球资本市场多年的资深价值投资分析师�
 2. **没进榜的每一只都必须出现在 rejected 里，一只都不能漏。**
    用户要知道自己池子里每只票此刻的状态，「没提到」对他等于信息丢失。
    每条 rejected 的 why 恰好写三句连贯的话，依次讲清：现在处于什么状态、
-   为什么现在不该买、什么条件出现才值得重新考虑。**不要写①②③之类的序号**，
+   为什么现在不该买、**什么条件出现才值得重新考虑**。**不要写①②③之类的序号**，
    直接写成三句话。keyData 另列支撑该判断的关键数据。
+   第三句的条件必须是**能从外面观察到**的经营或价格事件（「毛利率连续两季回升」
+   「回购公告落地」「价格回到 XX 以下」），不要写「等数据源补齐」「待系统修好」这类
+   用户无法据此行动的话——那是系统的问题，不是这只票的状态。
    rejected 按**离买入标准由近到远**排序（最接近达标的排最前）。
 
 ${COMMON}
@@ -103,7 +89,7 @@ ${COMMON}
       ${BOARD_FIELDS}
       ${ANCHOR_FIELDS}
       "stance": "仅 meetsBar 为 false 时填写：估值已修复/等待催化/基本面待验证/疑似价值陷阱/数据不足",
-      "attribution": "周期性底部/一次性事件冲击/流动性情绪杀/治理折价",
+      "attribution": "周期性底部/一次性事件冲击/流动性情绪杀/治理折价/盈利跑赢股价/结构性衰退/商业模式证伪/暂不归类",
       "thesis": "投资逻辑，三到四句",
       "killCriteria": ["若X发生则结论作废", "..."],
       "risks": ["关键风险 2-3 条"],
@@ -123,29 +109,36 @@ const TOOL_GUIDE = `【你可以主动取数】
 档案是机械层给的**摘要**，它答不了「这个便宜是错杀还是陷阱」——那需要行业格局、
 经营解释、管理层自述，这些不在档案里。所以给了你工具，不要只对着摘要下结论。
 
-最有价值的是 get_filing：它能取到年报/半年报（美股 10-K）里管理层自己写的
-行业判断、经营解释与风险披露。判断「错杀还是陷阱」时它通常比任何财务比率都管用。
+最有价值的是 get_filing：能取到年报/半年报里管理层自己写的行业判断、经营解释与风险披露。
+判断「错杀还是陷阱」时它通常比任何财务比率都管用。
+美股年报常已是半年多前的事：想知道最近一个季度管理层怎么说，用 form=10-Q 取最新季报。
 
-取数预算有限，**自己决定花在哪里**：
-- 对你认为可能被错杀、值得买入的标的多取，把结论做实；
-- 对明显已修复或明显是陷阱的，不必浪费；
+取数预算有限，**自己决定花在哪里**。判断的标准是「这份材料能不能推翻我现在的判断」：
+- 准备判**达标（值得买）**的标的必须取数，而且要去找**反证**——能推翻看多逻辑的那份材料
+  （最新季报里管理层怎么解释最近的经营变化、风险章节说了什么、现金流与利润是否背离）。
+  只看档案就下买入结论，等于拿一份可能过期的摘要下注；
+- 明显已修复或明显是陷阱的，不必浪费预算；
 - 拿不准的优先取——预算就是为了消除这种拿不准。
-预算接近用尽时系统会如实告知你，届时请开始收敛。`;
+预算接近用尽时系统会如实告知你，届时请开始收敛。
+（批内初筛不开工具，这是设计：分流用档案足够，深度留给终裁。）`;
 
 const BATCH_SYS = `你是深耕全球资本市场多年的资深价值投资分析师，遵循价值投资原则。
 
 下面是**用户自选池中的一批**（按行业聚拢，便于批内横向比较）。它们是用户点名跟踪的标的，
 没有经过任何粗筛：入池只代表用户的意图，不代表已经通过质量或估值检验。
 
-这是两段式裁决的第一段。你的任务不是写完整投资逻辑，而是**分流**：
+这是两段式裁决的第一段（批内初筛）。你的任务不是写完整投资逻辑，而是**分流**：
 
 1. picks：挑出这一批里**最多 {{MAX}} 只**值得进入终裁的。宁缺毋滥——
    这一批没有值得买的就给空数组，绝不为了凑数把估值已修复或基本面已证伪的放进来。
    picks 只写一句话说明为什么值得进终裁，**完整逻辑留给终裁，这里不要展开**。
+   两类都值得送进终裁（v0.11.3）：**看着可能达标**的，以及**便宜但你还拿不准**的
+   （后者请在 why 里写明拿不准的是什么——终裁会取数去查）。已经判为陷阱的不送。
 2. rejected：**这一批里其余每一只都必须出现，一只都不能漏。**
    用户要知道自己池子里每只票此刻的状态，「没提到」对他等于信息丢失。
    why 恰好三句连贯的话，依次讲清：现在处于什么状态、为什么现在不该买、
-   什么条件出现才值得重新考虑。**不要写①②③之类的序号**。keyData 另列关键数据。
+   什么条件出现才值得重新考虑（必须是能从外面观察到的经营或价格事件，
+   不要写「等数据源补齐」这类用户无法据此行动的话）。**不要写①②③之类的序号**。keyData 另列关键数据。
    rejected 按**离买入标准由近到远**排序（最接近达标的排最前）：终榜至少要有
    {{MIN_N}} 只，各批入围不够时，系统按这个次序把人补进终裁。
 
@@ -446,10 +439,10 @@ async function reviewBatch(profiles, { maxPicks, minN, onEvent, label } = {}) {
 }
 
 /**
- * 自选池裁决。池子小就一次调用；超过 `NARRATIVE.watchBatchSize` 走两段式：
+ * 自选池裁决。池子小就一次调用；超过 `NARRATIVE.watchBatchSize` 走两段式（批内初筛 → 终裁）：
  * 批内初筛（并行）→ 终裁只处理入围的。
  *
- * 两段式的语义代价：「谁进榜」先在批内比较、再做总排序，不再是全池严格同框
+ * 分批的语义代价：「谁进榜」先在批内比较、再做总排序，不再是全池严格同框
  * ——与市场挖掘的粗筛→裁决同一个路子（用户决策 2026-09-23）。
  * 换来的是每次调用的输出量恒定：单次写 43 份结论实测直接写不出来。
  */
@@ -472,7 +465,11 @@ export async function watchReview(profiles, {
     // 联网研究（v0.11.0）：小池子全员都进终裁，也就全员都研究。串在终裁之前——
     // 终裁要拿着研究结论下判断，所以这一段的耗时会直接加到总耗时上（上限 20 分钟）
     onProgress?.({ phase: 'research', done: 0, total: profiles.length });
-    const web = await runResearch(profiles, { onEvent });
+    // 小池子没有初筛，研究员拿不到「最该验证什么」；用池内各只的粗筛线索代替（v0.11.3）
+    const verifySmall = new Map(profiles
+      .filter((p) => p.checkNext)
+      .map((p) => [key(p.code), p.checkNext]));
+    const web = await runResearch(profiles, { onEvent, verify: verifySmall });
     onProgress?.({ phase: 'final', done: 0, total: 1 });
     const r = await reviewOnce(profiles, { topN, minN, onEvent, tools, web });
     onProgress?.({ phase: 'final', done: 1, total: 1 });
@@ -531,7 +528,16 @@ export async function watchReview(profiles, {
   // 联网研究只覆盖入围终裁的这几只——批内初筛不联网（用户决策 2026-09-27），
   // 与「批内初筛不开取数工具」同一条边界
   onProgress?.({ phase: 'research', done: 0, total: shortlist.length });
-  const web = await runResearch(shortlist, { onEvent });
+  // 研究员也要拿到「这批票各自最该验证什么」（v0.11.3 批 B）：初筛的 picks 没写这件事，
+  // 就退回该条落选理由里那句「为什么现在不该买」——研究员至少知道系统在犹豫什么
+  const verifyMap = new Map();
+  for (const r of results) {
+    if (!r.ok) continue;
+    for (const x of normalizeRejected(r.rejected, known)) {
+      if (!verifyMap.has(key(x.code)) && x.why) verifyMap.set(key(x.code), x.why);
+    }
+  }
+  const web = await runResearch(shortlist, { onEvent, verify: verifyMap });
   onProgress?.({ phase: 'final', done: 0, total: 1, shortlist: shortlist.length });
   const final = await reviewOnce(shortlist, {
     topN, minN, onEvent, tools, web, preScreened: { pool: profiles.length, batches: batches.length, promoted },
