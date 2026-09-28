@@ -125,6 +125,13 @@ export async function suggest(query, limit = 8) {
 }
 
 /** 关键字段覆盖率（§6.5）。 */
+/**
+ * 最新年报行。**A股三大报表是数组、美股是 { annual, quarterly } 对象**——v0.11 之前
+ * 这里一直按数组读，美股拿到 undefined：覆盖率因此只有 4/9、每只美股白扣 15 分置信度、
+ * 商誉占比恒为空（v0.11.3 统一在这里取）。
+ */
+const statementRow = (st) => (Array.isArray(st) ? st[0] : st?.annual?.[0]) || null;
+
 function coverageOf(fields) {
   const keys = Object.keys(fields);
   const have = keys.filter((k) => fields[k] != null && fields[k] !== '');
@@ -168,7 +175,9 @@ export async function analyzeOne(stock) {
   const anchors = val.anchorsFor({ row: { ...stock, price }, series, norm, market });
 
   // 每股口径：PE 路由用归一化 EPS；PB 路由用每股净资产；PS 路由用每股营收
-  const bps = latestInd.bps ?? safeDiv(statements?.annual?.[0]?.equity ?? null, shares);
+  // 美股是 { annual, quarterly } 对象，A股是数组：统一取最新年报行（v0.11.3）
+  const latestAnnual = statementRow(statements);
+  const bps = latestInd.bps ?? safeDiv(latestAnnual?.equity ?? null, shares);
   const revTtm = ttmRevenue(statements, market);
   const perShare = route.primary === 'pe' ? norm.normEps
     : route.primary === 'pb' ? bps
@@ -180,7 +189,7 @@ export async function analyzeOne(stock) {
   const band = val.bands({ route, perShare, pcts, price });
 
   // ── 质量闸门 ────────────────────────────────────────────
-  const goodwillRatio = safeDiv(statements?.[0]?.goodwill ?? null, statements?.[0]?.equity ?? null);
+  const goodwillRatio = safeDiv(latestAnnual?.goodwill ?? null, latestAnnual?.equity ?? null);
   const gate = market === 'cn'
     ? (fin && orgTypeGuess ? qualityGateFinancial(indicators, orgTypeGuess)
       : qualityGateGeneral(indicators, { goodwillRatio }))
@@ -191,7 +200,7 @@ export async function analyzeOne(stock) {
   const peers = await peerGroup(stock);
   const ttmNetProfit = market === 'cn'
     ? ttmFromCumulative(indicators)
-    : (statements.quarterly || []).slice(0, 4).reduce((s, r) => s + (r.parentNetProfit ?? r.netProfit ?? 0), 0) || null;
+    : (statements?.quarterly || []).slice(0, 4).reduce((s, r) => s + (r.parentNetProfit ?? r.netProfit ?? 0), 0) || null;
   const vw = {
     selfHistory: views.viewSelfHistory({ series: series.rows, field: route.primary, current: latestSeries[route.primary] ?? stock[route.primary] }),
     peers: views.viewPeers({ current: stock[route.primary] ?? latestSeries[route.primary], peers, field: route.primary }),
@@ -210,7 +219,7 @@ export async function analyzeOne(stock) {
 
   // ── 置信度 ──────────────────────────────────────────────
   const cov = coverageOf({
-    revenue: latestInd.revenue ?? statements?.[0]?.revenue, operateProfit: latestInd.operateProfit,
+    revenue: latestInd.revenue ?? latestAnnual?.revenue, operateProfit: latestInd.operateProfit,
     netProfit: latestInd.parentNetProfit, ocf: latestInd.ocf ?? latestInd.ocfPerShare,
     totalAssets: latestInd.totalAssets, equity: latestInd.equity ?? bps,
     shares, price, industry: stock.industry,

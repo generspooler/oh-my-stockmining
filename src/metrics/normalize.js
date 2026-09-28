@@ -182,6 +182,12 @@ export function quarterlyHistory(statements, market, { n = 8 } = {}) {
       netProfit: np(r),
       npYoy: yoy(np(r), np(prev)),
       eps: r.eps ?? null,
+      epsDiluted: r.epsDiluted ?? null,
+      // 非经营损益 = 税前利润 − 营业利润（利息、投资收益、其他收支）。v0.11.3：此前档案看不到，
+      // 而它能占到税前利润的一大块（实测 2026Q2 GOOGL 71%、AMZN 66%、NVDA 11%）——
+      // PE(TTM) 因此被非经营收益压低，模型却只看到「利润增长很快」
+      nonOpShare: r.totalProfit != null && r.operateProfit != null && r.totalProfit > 0
+        ? (r.totalProfit - r.operateProfit) / r.totalProfit : null,
     };
   });
   return { asOf: rows[0].period, rows };

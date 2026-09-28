@@ -78,6 +78,15 @@ export function buildMinePayload({ market, scope = 'market', meta, coarse, profi
     toolLog: verdict?.toolLog || [],
     toolCalls: verdict?.toolCalls ?? 0,
     toolsDisabled: verdict?.toolsDisabled || undefined,
+    // 本轮状态（v0.11.3）。此前这些只活在内存里：回放出来的榜单看不出
+    // 「模型有数字存疑」「预算用尽」「有几批整批失败」「有几只根本没被回答」——
+    // 而这几件事恰恰决定该不该信这张榜。
+    suspectNumbers: verdict?.suspectNumbers?.length ? verdict.suspectNumbers : undefined,
+    budgetExhausted: verdict?.budgetExhausted || undefined,
+    batchFailed: verdict?.batchFailed?.length ? verdict.batchFailed : undefined,
+    unanswered: verdict?.unanswered || undefined,
+    promoted: verdict?.promoted?.length ? verdict.promoted : undefined,
+    shortlist: verdict?.shortlist ?? undefined,
     // 市场裁决的三段式概要（初排点名几只 / 深挖是否完成）。复盘时要能看出
     // 某一轮的榜单到底有没有深挖支撑——深挖失败是允许的，但不能看不出来。
     phases: verdict?.phases || undefined,
@@ -89,6 +98,9 @@ export function buildMinePayload({ market, scope = 'market', meta, coarse, profi
       // v0.10.0 起没有「主口径」：全部锚都存，模型选了哪个在 top/rejected 的 valuation 里。
       // pv/tier 只在旧快照里有（按周期规则选的单一口径），回放时继续认
       anchors: p.anchors ? compactAnchors(p.anchors) : undefined,
+      // 反算口径说明（v0.11.3）：拆股是否折算过、PB 是否只有年报净资产。它决定这组分位可不可信
+      seriesNotes: p.seriesNotes || undefined,
+      seriesSource: p.seriesSource || undefined,
       pv: p.band?.pv ?? null, tier: p.band?.tier?.name ?? null, fScore: p.fScore,
       drawdowns: p.drawdowns,
       // 回撤口径（§2.6）。旧快照没有这个字段 → 回放时按「旧口径（未复权）」提示，

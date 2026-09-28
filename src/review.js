@@ -373,6 +373,11 @@ async function reviewOnce(profiles, { topN, minN, onEvent, preScreened = null, t
         continue;
       }
       const { top, rejected, externalNotes } = normalizeReview(json, profiles, { topN: n, minN: min });
+      // 终裁自己给的落选理由（含对数据/研究段的质疑）：大池子路径此前把这一整块丢在这里，
+      // 于是「模型质疑过」与「模型没质疑」在结果里长得一样（v0.11.3）
+      const droppedNotes = rejected
+        .filter((x) => x.why && !x.unanswered)
+        .map((x) => ({ code: x.code, claim: x.why, why: '终裁落选理由' }));
       if (!top.length && rejected.every((x) => x.unanswered)) {
         dumpRaw('review', r, new Error('模型输出的代码全部不在自选池内'));
         continue;
@@ -386,7 +391,7 @@ async function reviewOnce(profiles, { topN, minN, onEvent, preScreened = null, t
       const v = validateNumbers(text, whitelistOf(prompt + (tr ? '\n' + tr.text() : '')));
       if (!v.ok) onEvent?.({ type: 'suspect', values: v.violations.map((x) => x.value) });
       return {
-        ok: true, model: r.model, top, rejected, externalNotes,
+        ok: true, model: r.model, top, rejected, externalNotes, droppedNotes,
         note: json.note || null, suspectNumbers: v.violations,
         toolLog: r.toolLog || [], toolCalls: r.toolCalls || 0,
         toolsDisabled: r.toolsDisabled || undefined, budgetExhausted: r.budgetExhausted || undefined,
@@ -519,7 +524,7 @@ export async function watchReview(profiles, {
       top: [], rejected,
       note: batchFailed.length ? null : '各批初筛后无一只进入终裁：池内当前没有达到买入标准的标的。',
       suspectNumbers: suspect, batches: batches.length, calls: batches.length,
-      batchFailed, unanswered: rejected.filter((x) => x.unanswered).length,
+      batchFailed, unanswered: rejected.filter((x) => x.unanswered).length, externalNotes: [],
     };
   }
 
@@ -538,9 +543,14 @@ export async function watchReview(profiles, {
 
   // 终裁的落选 + 各批的落选，再对全池兜底
   const rejected = completeCoverage(final.top, [...final.rejected, ...batchRejected], profiles);
+  // externalNotes 是模型「基于自身知识的质疑」的唯一合法出口（分层数字规则的 L3），
+  // 大池子此前整个丢掉，实测 44 只那轮 externalNotes 为空数组（v0.11.3）。
+  // 终裁自己也常常把质疑写进落选理由——同一个出口，一并带上
+  const externalNotes = [...(final.externalNotes || []), ...(final.droppedNotes || [])]
+    .filter((x, i, arr) => arr.findIndex((y) => `${y.code || ''}::${y.claim}` === `${x.code || ''}::${x.claim}`) === i);
   return {
     ...base, ok: true, model: final.model,
-    top: final.top, rejected, note: final.note,
+    top: final.top, rejected, note: final.note, externalNotes,
     suspectNumbers: [...(final.suspectNumbers || []), ...suspect],
     batches: batches.length, calls: batches.length + 1, shortlist: shortlist.length,
     promoted: promoted.length ? promoted : undefined,

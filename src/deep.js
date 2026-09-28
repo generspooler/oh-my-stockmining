@@ -34,10 +34,17 @@ export async function profileOne(row, newsPack) {
   const shares = row.shares ?? series.shares ?? null;
   const norm = statements ? normalizedEarnings(statements, market, { shares, isFinancial: fin }) : { ok: false, reason: '报表不可得' };
 
+  const dd = drawdowns(pricePack.usable ? pricePack.rows : []);
+  // 行情接口的日频「距 52 周最高价」（v0.11.3）：补月末采样看不见的月中高点。
+  // 它是未复权价，一年内拆过股会深出几十个百分点——比月线口径还深 40 个百分点以上就不采用
+  const d52 = row.drawdown52;
+  const daily52 = d52 == null ? null
+    : (dd.dd52w == null || d52 >= dd.dd52w - 0.4) ? { value: d52 } : { value: null, rejected: d52 };
   return {
     ...row,
     // 序列不可用（取不到 / 未复权且检测到拆股）时整体置空，不输出错的数
-    drawdowns: drawdowns(pricePack.usable ? pricePack.rows : []),
+    drawdowns: dd,
+    drawdown52Daily: daily52,
     priceSeries: {
       adjusted: !!pricePack.adjusted, source: pricePack.source,
       splitSuspect: !!pricePack.splitSuspect, usable: !!pricePack.usable,
@@ -51,6 +58,8 @@ export async function profileOne(row, newsPack) {
     quarters: statements ? quarterlyHistory(statements, market) : null,
     seriesSource: series.source, seriesPoints: series.rows?.length || 0,
     seriesAsOf: series.rows?.[0]?.date || null,
+    // 反算口径说明（v0.11.3）：拆股已折算、PB 只有年报净资产等。它决定模型该不该信这组分位
+    seriesNotes: series.notes?.length ? series.notes : null,
     news: newsPack || null,
   };
 }
@@ -107,12 +116,15 @@ export function renderValuation(p) {
     for (const r of q.rows) {
       L.push(`　　${r.period}　营收 ${f(r.revenue == null ? null : r.revenue / 1e8, 1)}（同比 ${sgn(r.revYoy)}）`
         + `　营业利润率 ${pc(r.opMargin)}　归母净利 ${f(r.netProfit == null ? null : r.netProfit / 1e8, 1)}（同比 ${sgn(r.npYoy)}）`
-        + `　EPS ${f(r.eps)}`);
+        + `　EPS 基本 ${f(r.eps)} / 稀释 ${f(r.epsDiluted)}`
+        + (r.nonOpShare != null ? `　非经营损益占税前 ${sgn(r.nonOpShare)}` : ''));
     }
+    L.push('　　（非经营损益 = 税前利润 − 营业利润：利息、投资收益、其他收支；占比高时 PE(TTM) 会被它压低）');
   }
   const anchors = p.anchors || [];
   if (anchors.length) {
     L.push(`估值锚（全部并排，机械层不选锚；P/V = 现值 ÷ 5年中位，安全边际 = 1 − P/V${p.seriesAsOf ? `；现值截至 ${p.seriesAsOf}` : ''}）：`);
+    if (p.seriesNotes) L.push(`　　历史序列口径：${p.seriesNotes.join('；')}`);
     for (const a of anchors) {
       if (!a.ok) { L.push(`　　${a.label.padEnd(8)} 不可用（${a.reason}）`); continue; }
       L.push(`　　${a.label.padEnd(8)} 现值 ${f(a.current, 2)}｜5年 P25/P50/P75 ${f(a.p25, 2)}/${f(a.p50, 2)}/${f(a.p75, 2)}`
@@ -120,7 +132,7 @@ export function renderValuation(p) {
         + `｜5年分位对应价格 ${cur}${f(a.prices?.p25, 2)}/${f(a.prices?.p50, 2)}/${f(a.prices?.p75, 2)}［${a.from}］`);
       const diag = [];
       if (a.excluded) diag.push(`5年窗口 ${a.window} 个点里 ${a.excluded} 个为负或缺失（亏损期），未计入分位`);
-      if (a.insufficient) diag.push(`序列仅 ${f(a.years, 1)} 年，不足 3 年`);
+      if (a.insufficient) diag.push(`有效点仅 ${a.n} 个、跨度 ${f(a.years, 1)} 年，不足 3 年——分位不可靠`);
       // ROE 前后对比：两条路径都从同一份年报序列算，年份与 5 年分位窗口对齐
       // （此前挖掘与单股各用各的「5年中位」，同一只票一边 3.6% 一边 2.2%）
       if (a.key === 'pb' && h?.roe?.length) {
@@ -167,11 +179,15 @@ export function renderProfile(p, i) {
   // 序列口径必须回写（§2.6 步骤 4）：模型看不到「这个序列只有 59 个点、跨了 17 年」，
   // 就无从怀疑喂给它的跌幅。「—」一律表示该区间历史不覆盖，不是「没跌」。
   L.push(renderCoverage(p.priceSeries, d));
-  L.push(`回撤：13周 ${pc(d.dd13w)}　26周 ${pc(d.dd26w)}　52周 ${pc(d.dd52w)}　3年 ${pc(d.dd3y)}　5年 ${pc(d.dd5y)}`);
+  L.push(`回撤（月末收盘，距区间内最高月末收盘）：13周 ${pc(d.dd13w)}　26周 ${pc(d.dd26w)}　52周 ${pc(d.dd52w)}　3年 ${pc(d.dd3y)}　5年 ${pc(d.dd5y)}`
+    + (p.drawdown52Daily?.value != null ? `｜距52周最高价（日频，行情接口）${pc(p.drawdown52Daily.value)}`
+      : p.drawdown52Daily?.rejected != null ? `｜行情接口距52周最高价 ${pc(p.drawdown52Daily.rejected)} 与月线口径差异过大（疑似未复权），未采用` : ''));
   L.push(`区间收益：13周 ${pc(d.ret13w)}　26周 ${pc(d.ret26w)}　52周 ${pc(d.ret52w)}　3年 ${pc(d.ret3y)}　5年 ${pc(d.ret5y)}`);
 
   L.push(`基本面：ROE ${f(p.roe, 1)}%（5年中位 ${f(p.roeMedian5, 1)}%）　毛利率 ${f(p.grossMargin, 1)}%　负债率 ${f(p.debtRatio, 1)}%　F-Score ${p.fScore ?? '—'}`);
-  L.push(`　　　　营收CAGR ${pc(p.revenueCagr)}　累计FCF/净利 ${f(p.cumFcfToProfit)}　ROIC ${f(p.roic, 1)}%　利息保障 ${f(p.interestCoverage, 1)}x`);
+  L.push(`　　　　营收CAGR ${pc(p.revenueCagr)}　累计FCF/净利 ${f(p.cumFcfToProfit)}`
+    + `${p.cumFcfYears && p.fundamentals?.years?.length && p.cumFcfYears < p.fundamentals.years.length ? `（仅 ${p.cumFcfYears} 年配对得上）` : ''}`
+    + `　ROIC ${f(p.roic, 1)}%　利息保障 ${f(p.interestCoverage, 1)}x`);
 
   L.push(...renderValuation(p));
   L.push('新闻与公告：');

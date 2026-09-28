@@ -29,23 +29,109 @@ export async function multipleSeries(stock) {
 }
 
 /**
- * 美股估值序列反算：历史日收盘 × 股数 ÷ 当期可得的 TTM 盈利 / 净资产 / 营收。
- * 关键是 PIT——每个交易日只能用「该日之前已披露」的财报，否则有前视偏差。
- * 日K 必须取不复权（fqt=0），复权价乘股数不等于当时市值。
+ * 拆股事件（纯函数，可测）。adj = 后复权月线、raw = 不复权月线，均 [{date, close}]，任意次序。
+ *
+ * 同一个月「后复权 ÷ 不复权」之比只随两件事变：分红（每年几个百分点）与拆股（整数倍）。
+ * 相邻两月之比跳到 ≥ 1.45 或 ≤ 0.69 即判为该月发生拆股（合股），跳幅就是比例。
+ * 这**不是**从价格跳变猜拆股——两条序列是同一组成交价，比值里没有涨跌，只有复权因子
+ * （v0.12 的教训：NVDA 一个月真实涨 8.87 倍的行情被当成过 8:1 拆股）。
+ * 返回 [{ ym: 'YYYY-MM', ratio }]，旧→新；ratio > 1 为拆股，< 1 为合股。
+ */
+export function splitEvents(adj, raw) {
+  const ym = (d) => String(d).slice(0, 7);
+  const A = new Map((adj || []).map((r) => [ym(r.date), r.close]));
+  const g = (raw || []).slice().sort((a, b) => (a.date < b.date ? -1 : 1))
+    .map((r) => ({ ym: ym(r.date), g: A.get(ym(r.date)) / r.close }))
+    .filter((x) => isFinite(x.g) && x.g > 0);
+  const out = [];
+  for (let i = 1; i < g.length; i++) {
+    const r = g[i].g / g[i - 1].g;
+    if (r >= V.splitJumpUp || r <= V.splitJumpDown) out.push({ ym: g[i].ym, ratio: r });
+  }
+  return out;
+}
+
+/** 某月之后（不含该月）发生的拆股累计比例：该月 1 股 = 现在多少股。 */
+const splitAfter = (events, ym) => events.filter((e) => e.ym > ym).reduce((p, e) => p * e.ratio, 1);
+
+/**
+ * 报表股数折到**现在的股数基数**（纯函数，可测）。
+ *
+ * 东财美股年报股数常按后来的拆股回溯重述，单季报却多是原始申报值，同一份报表里两种基数并存
+ * （实测 NVDA：FY2024 年报 249.4 亿股 = 拆股后口径；2023-04 单季报 24.9 亿 = 拆股前口径）。
+ * 每期股数只有两类可能：原样申报（还要乘上此后全部拆股）或已重述到此后某次拆股之后。
+ * 拆股比例 ≥ 1.5，真实股数几年里的变化远小于它，所以取「折算后最接近参照」的那个解释。
+ * ref：现基数下的参照股数（最近一期股数，拿不准时用市值 ÷ 现价裁决）。
+ * 返回 [{ ...snap, sharesNow, restated }]。
+ */
+export function sharesToCurrentBasis(snaps, events, ref) {
+  if (!events?.length || !(ref > 0)) return (snaps || []).map((s) => ({ ...s, sharesNow: s.shares, restated: false }));
+  return (snaps || []).map((s) => {
+    const later = events.filter((e) => e.ym > String(s.period).slice(0, 7));
+    // 候选「已被计入的拆股」：没重述、重述到第 1 次之后、……、重述到最近一次之后
+    const applied = [1];
+    for (const e of later) applied.push(applied[applied.length - 1] * e.ratio);
+    const total = applied[applied.length - 1];
+    let best = null;
+    for (const a of applied) {
+      const now = s.shares * (total / a);
+      const err = Math.abs(Math.log(now / ref));
+      if (!best || err < best.err) best = { now, err, a };
+    }
+    return { ...s, sharesNow: best.now, restated: best.a !== 1 };
+  });
+}
+
+/** 一只票现基数的参照股数：最近一期股数的两种解释里，离「市值 ÷ 现价」更近的那个。 */
+function referenceShares(latest, events, capShares) {
+  if (!latest) return null;
+  const after = splitAfter(events, String(latest.period).slice(0, 7));
+  const cands = [latest.shares * after, latest.shares];
+  if (!(capShares > 0) || after === 1) return cands[0];
+  return cands.reduce((b, c) => (Math.abs(Math.log(c / capShares)) < Math.abs(Math.log(b / capShares)) ? c : b));
+}
+
+/**
+ * 美股估值序列反算：历史月收盘 × 当月股数 ÷ 当期可得的 TTM 盈利 / 净资产 / 营收。
+ * 关键是 PIT——每个月只能用「该月之前已披露」的财报，否则有前视偏差。
+ * 价格必须取不复权（复权价乘股数不等于当时市值）；股数与价格必须是**同一基数**（v0.11.3）。
+ *
+ * v0.11.3 修掉的三处口径错误（全部静默，实测会翻转安全边际）：
+ *   1. 拆股：重述后的股数 × 拆股前的价格 → NVDA 2023-04 PE 算成 1592 倍；AVGO PS 锚安全边际 +19% 实为约 −32%。
+ *   2. 股数不设时效：GOOGL 年报股数最新一期是 FY2012（6.65 亿股，现约 122 亿），PE 中位算成 1.4 倍。
+ *      现在年报 + 单季报股数合用，超过 `V.staleSnapshotDays` 的快照不用。
+ *   3. PB 历史只用年报净资产、现值却是接口最新季：净资产增长快的公司 PB 系统性显得便宜 15%~50%。
+ *      现在净资产用季度资产负债表（取不到才退回年报，并让现值同口径反算）。
+ * 另：报表币种不是美元（ADR / 外国发行人）时不反算——汇率与 ADR 换股比例未核实，
+ * TSM 的 PE 历史因此曾被算成真实值的六分之一。
  */
 async function reverseUsSeries(stock) {
   const suffix = em.usSuffix(stock.mk);
-  const [bars, st] = await Promise.all([
+  const secid = stock.secid || em.usSecid(stock.code, stock.mk);
+  const [bars, st, adj] = await Promise.all([
     tx.monthly(stock.code, 'us', stock.mk),   // 月频足够算分位，且不依赖已挂掉的东财 push2
     em.statementsUS(stock.code, suffix),
+    // 与 returns.adjustedMonthly 同一个请求（同一缓存键），只用来定位拆股
+    em.kline(secid, { klt: 103, fqt: 2, beg: SCREENING.drawdown.beg }).catch(() => []),
   ]);
   if (!bars?.length) return { source: '反算失败：历史价格不可得', rows: [] };
 
-  // 单季报累加成 TTM，并记录该期的可用日（美股财报无 NOTICE_DATE，按期末 +45 天估计披露）
+  const currency = st.quarterly?.[0]?.currency || st.annual?.[0]?.currency || 'USD';
+  if (currency !== 'USD') {
+    return {
+      source: `反算不可用：报表币种 ${currency}`, rows: [], unavailable: true,
+      reason: `报表币种为 ${currency}（多为 ADR / 外国发行人），与美元股价不能直接相除；汇率与 ADR 换股比例未核实，不出历史分位`,
+    };
+  }
+
+  // 单季报累加成 TTM，并记录该期的可用日（美股财报无 NOTICE_DATE，按期末 +45 天估计披露）。
+  // 四个季度必须连续（首尾期末相距约 9 个月）：有断档时拼出来的不是 TTM
   const q = (st.quarterly || []).filter((r) => r.revenue != null || r.netProfit != null).slice().reverse(); // 旧→新
   const ttm = [];
   for (let i = 3; i < q.length; i++) {
     const win = q.slice(i - 3, i + 1);
+    const span = daysBetween(win[0].period, win[3].period);
+    if (!(span >= 240 && span <= 310)) continue;
     const sum = (k) => (win.every((r) => r[k] != null) ? win.reduce((s, r) => s + r[k], 0) : null);
     ttm.push({
       period: q[i].period,
@@ -54,27 +140,47 @@ async function reverseUsSeries(stock) {
       revenue: sum('revenue'),
     });
   }
-  // 年报给净资产与股数
-  const ann = (st.annual || []).slice().sort((a, b) => (a.period < b.period ? -1 : 1));
-  const equitySnaps = ann.filter((r) => r.equity != null)
-    .map((r) => ({ availableFrom: shiftDays(r.period, 75), equity: r.parentEquity ?? r.equity }));
-  const shareSnaps = ann.filter((r) => r.sharesDiluted != null || r.sharesBasic != null)
-    .map((r) => ({ availableFrom: shiftDays(r.period, 75), shares: r.sharesDiluted ?? r.sharesBasic }));
 
-  const pickAsOf = (snaps, date, key) => {
+  // 净资产：优先季度资产负债表（v0.11.3），取不到退回年报
+  const balances = (st.balances || []).filter((r) => r.equity != null || r.parentEquity != null);
+  const equityQuarterly = balances.some((r) => r.reportType && r.reportType !== '年报');
+  const eqSrc = equityQuarterly ? balances : (st.annual || []).filter((r) => r.equity != null);
+  const equitySnaps = eqSrc.slice().sort((a, b) => (a.period < b.period ? -1 : 1))
+    .map((r) => ({
+      period: r.period, equity: r.parentEquity ?? r.equity,
+      availableFrom: shiftDays(r.period, r.reportType && r.reportType !== '年报' ? 45 : 75),
+    }));
+
+  // 股数：年报 + 单季报合用，折到现基数
+  const rawShares = [
+    ...(st.annual || []).map((r) => ({ period: r.period, lag: 75, shares: r.sharesDiluted ?? r.sharesBasic })),
+    ...(st.quarterly || []).map((r) => ({ period: r.period, lag: 45, shares: r.sharesDiluted ?? r.sharesBasic })),
+  ].filter((s) => s.shares > 0).sort((a, b) => (a.period < b.period ? -1 : a.period > b.period ? 1 : a.lag - b.lag));
+  const byPeriod = new Map();
+  for (const s of rawShares) if (!byPeriod.has(s.period)) byPeriod.set(s.period, s);   // 同一期末优先单季报
+  const shareRaw = [...byPeriod.values()];
+  const events = splitEvents(adj, bars);
+  const capShares = stock.marketCap > 0 && stock.price > 0 ? stock.marketCap / stock.price : null;
+  const ref = referenceShares(shareRaw[shareRaw.length - 1], events, capShares);
+  const shareSnaps = sharesToCurrentBasis(shareRaw, events, ref)
+    .map((s) => ({ ...s, availableFrom: shiftDays(s.period, s.lag) }));
+
+  const pickAsOf = (snaps, date) => {
     let v = null;
-    for (const s of snaps) { if (s.availableFrom <= date) v = s[key]; else break; }
-    return v;
+    for (const s of snaps) { if (s.availableFrom <= date) v = s; else break; }
+    // 过期的快照不用：宁可这个月没有点，也不拿十年前的股数去乘今天的股价
+    return v && daysBetween(v.period, date) <= V.staleSnapshotDays ? v : null;
   };
 
   const rows = [];
   for (const b of bars) {
-    const shares = pickAsOf(shareSnaps, b.date, 'shares');
-    if (!shares || !b.close) continue;
-    const cap = b.close * shares;
-    const e = pickAsOf(ttm, b.date, 'netProfit');
-    const eq = pickAsOf(equitySnaps, b.date, 'equity');
-    const rev = pickAsOf(ttm, b.date, 'revenue');
+    const sh = pickAsOf(shareSnaps, b.date);
+    if (!sh || !b.close) continue;
+    // 当月价格是当月基数：现基数股数 ÷ 此后的拆股比例 = 当月基数股数
+    const cap = b.close * (sh.sharesNow / splitAfter(events, String(b.date).slice(0, 7)));
+    const e = pickAsOf(ttm, b.date)?.netProfit;
+    const eq = pickAsOf(equitySnaps, b.date)?.equity;
+    const rev = pickAsOf(ttm, b.date)?.revenue;
     rows.push({
       date: b.date, close: b.close,
       pe: e && e > 0 ? cap / e : null,
@@ -85,9 +191,23 @@ async function reverseUsSeries(stock) {
   // 统一为「新→旧」：A股估值序列是 desc，两边必须一致，
   // 否则 rows[0] 在美股会取到十年前那个点，分位窗口也会截到最老的一段。
   rows.reverse();
-  return { source: '腾讯月线 × 东财报表反算（PIT）', rows, reversed: true, freq: 'monthly',
-    shares: shareSnaps.length ? shareSnaps[shareSnaps.length - 1].shares : null };
+  const restated = shareSnaps.filter((s) => s.restated).length;
+  const notes = [
+    events.length
+      ? `拆股 ${events.map((e) => `${e.ym} ${e.ratio >= 1 ? `${fmtRatio(e.ratio)}:1` : `1:${fmtRatio(1 / e.ratio)}`}`).join('、')}，股数已折到同一基数`
+        + (restated ? `（其中 ${restated} 期报表股数是按后来拆股重述过的）` : '')
+      : (adj?.length ? null : '复权序列不可得，未能核对拆股口径'),
+    equityQuarterly ? null : 'PB 历史只有年报净资产（季度资产负债表不可得），现值按同口径反算',
+  ].filter(Boolean);
+  const latestEq = equitySnaps[equitySnaps.length - 1] || null;
+  return {
+    source: '腾讯月线 × 东财报表反算（PIT）', rows, reversed: true, freq: 'monthly',
+    shares: ref ?? null, splits: events, notes, equityQuarterly,
+    latestEquity: latestEq ? { period: latestEq.period, equity: latestEq.equity } : null,
+  };
 }
+
+const fmtRatio = (r) => (Math.abs(r - Math.round(r)) < 0.05 ? String(Math.round(r)) : r.toFixed(2));
 
 const shiftDays = (period, n) => {
   const d = new Date(period);
@@ -110,18 +230,24 @@ export function multiplePercentiles(rows, field, freq = 'daily') {
   const perYear = freq === 'monthly' ? 12 : 250;
   const minN = freq === 'monthly' ? Math.round((V.minWindowDays / 250) * 12) : V.minWindowDays;
   const win = windowOf(rows, freq);
-  let vals = win.map((r) => r[field]).filter((x) => x != null && isFinite(x) && x > 0);
+  const valid = win.filter((r) => r[field] != null && isFinite(r[field]) && r[field] > 0);
+  let vals = valid.map((r) => r[field]);
   if (!vals.length) return { ok: false, reason: `${field} 序列为空` };
   // 被剔除的点（缺失或 ≤0，即亏损期 / 净资产为负）要如实计数：它是「这个锚失真没有」的直接证据
   const excluded = win.length - vals.length;
   const cap = percentile(vals, V.outlierPct);
   vals = vals.filter((x) => x <= cap);
-  const years = win.length / perYear;
+  // 年数按**有效点**的真实日期跨度算（v0.11.3）：窗口 60 个月、有效点只有 9 个时，它不是 5 年分位
+  const dated = valid.filter((r) => r.date);
+  const years = dated.length >= 2
+    ? (Math.abs(daysBetween(dated[dated.length - 1].date, dated[0].date)) + 365 / perYear) / 365.25
+    : valid.length / perYear;
   return {
     ok: true,
     p25: percentile(vals, 25), p50: percentile(vals, 50), p75: percentile(vals, 75),
     n: vals.length, years, window: win.length, excluded,
-    insufficient: win.length < minN,
+    // 有效点数不足 3 年的量（月频 36、日频 750），或有效点真实跨度不足 3 年
+    insufficient: vals.length < minN || years < V.minValidYears,
     field,
   };
 }
@@ -227,12 +353,27 @@ export function anchorsFor({ row, series, norm, market }) {
   const latest = rows[0] || {};
   const price = row?.price ?? latest.close ?? null;
   const out = [];
+  // 反算被判为不可做（报表非美元等）：每个锚都如实写原因，不留一个「序列为空」让模型猜
+  if (series?.unavailable) {
+    for (const def of ANCHOR_DEFS) {
+      if (market === 'us' && !US_KEYS.has(def.key)) continue;
+      out.push({ key: def.key, label: def.label, from: '反算', ok: false, reason: series.reason });
+    }
+    out.push({ key: 'pe_norm', label: '归一化PE', from: '系统推算 · 反算历史', ok: false, reason: series.reason });
+    return out;
+  }
   for (const def of ANCHOR_DEFS) {
     if (market === 'us' && !US_KEYS.has(def.key)) continue;
     let current = latest[def.field] ?? null;
     let from = market === 'cn' ? '接口' : '反算';
-    // 美股 PE(TTM)/PB 的**当前值**东财行情列表直接给，优先用接口值；历史仍是反算
-    if (market === 'us' && (def.key === 'pe' || def.key === 'pb') && row?.[def.key] != null) {
+    // 美股 PE(TTM)/PB 的**当前值**东财行情列表直接给，优先用接口值；历史仍是反算。
+    // 例外（v0.11.3）：PB 历史只有年报净资产时，接口现值（最新季净资产）与历史不同口径，
+    // 改用同一份净资产反算现值——同口径的旧数，比不同口径的新数更能比
+    const pbAnnualOnly = market === 'us' && def.key === 'pb' && series?.equityQuarterly === false;
+    if (pbAnnualOnly && series.latestEquity?.equity > 0 && series.shares > 0 && price > 0) {
+      current = (price * series.shares) / series.latestEquity.equity;
+      from = `反算（年报净资产 ${series.latestEquity.period}，与历史同口径）`;
+    } else if (market === 'us' && (def.key === 'pe' || def.key === 'pb') && row?.[def.key] != null) {
       current = row[def.key];
       from = '接口现值 · 反算历史';
     }
@@ -264,9 +405,16 @@ export function resolveAnchor(choice, anchors) {
   };
 }
 
-/** 落盘 / 推给前端的精简形态：不带分位窗口原始数据。 */
+/**
+ * 落盘 / 推给前端的精简形态：不带分位窗口原始数据。
+ * v0.11.3 起留下 P25/P75、有效点数、剔除数、样本不足——事后复核「这个锚当时可不可信」只能靠它们。
+ */
 export const compactAnchors = (anchors) => (anchors || []).map((a) => (a.ok
-  ? { key: a.key, label: a.label, ok: true, from: a.from, current: a.current, p50: a.p50, rank: a.rank, pv: a.pv, tier: a.tier?.name }
+  ? {
+    key: a.key, label: a.label, ok: true, from: a.from, current: a.current,
+    p25: a.p25, p50: a.p50, p75: a.p75, rank: a.rank, pv: a.pv, tier: a.tier?.name,
+    n: a.n, excluded: a.excluded || undefined, insufficient: a.insufficient || undefined,
+  }
   : { key: a.key, label: a.label, ok: false, reason: a.reason }));
 
 // v0.3 起安全边际不再是淘汰闸门，只作为「按传统标准需要多深折价」的参考值展示给模型。

@@ -762,9 +762,12 @@ export function validateNumbers(text, whitelist, { tolerance = 0.02 } = {}) {
     seen.add(raw);
     if (Number.isInteger(v) && Math.abs(v) <= 12) continue;        // 序号 / 条数 / 月份
     if (Number.isInteger(v) && v >= 1900 && v <= 2100) continue;   // 年份
-    // 比较取绝对值：中文用「折价 / 低于 / 下滑」承载符号，
+    // 比较仍取绝对值：中文用「折价 / 低于 / 下滑」承载符号，
     // 注入值 相对保守档偏离 = -0.1243 与文本「折价 12.4%」说的是同一件事，
     // 带符号比较会把它误判为幻觉（实测茅台一次运行里 12.4 被误标）。
+    // ⚠ 这个校验只在**整份输入**里找数字，所以它挡不住「数字对、公司/方向/期间错」——
+    // 实测「营收同比 +106%」写成「下滑 106%」照样通过。它是弱报警器，不是事实核验；
+    // 真要核验得把数字绑定到「公司 + 指标 + 期间」（v0.12 做过一版，随该版一起丢弃）。
     const hit = allowed.some((a) => {
       const A = Math.abs(a), V = Math.abs(v);
       for (const cand of [A, A * 100, A / 100, A * 1e4, A / 1e4, A * 1e8, A / 1e8]) {
@@ -778,7 +781,11 @@ export function validateNumbers(text, whitelist, { tolerance = 0.02 } = {}) {
   return { ok: violations.length === 0, violations };
 }
 
-/** 白名单 = 提示词里出现过的全部数字（模型只能用我们给它的数）。 */
+/**
+ * 白名单 = 提示词里出现过的全部数字（模型只能用我们给它的数）。
+ * 纯函数；不按公司分组建白名单——那样「把 A 的涨幅安到 B 头上」就查不出来了，
+ * 但那要先把事实绑定到公司/指标/期间（见 validateNumbers 的说明），本版没做。
+ */
 export function whitelistOf(prompt) {
   const wl = {};
   let i = 0;

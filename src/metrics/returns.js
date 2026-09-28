@@ -150,6 +150,8 @@ export function renderCoverage(pack, dd) {
   }
   const c = dd?.coverage || {};
   const adj = pack.adjusted ? '已复权' : '未复权';
-  return `价格序列：${c.months ?? '—'} 个月点，${c.from || '—'} → ${c.to || '—'}（${adj}，来源 ${pack.source}）`
+  // 「月末收盘」必须写出来（v0.11.3）：月中创的新高、月中的急跌都看不见，
+  // 实测 44 只美股自选里 8 只的 13/26/52 周回撤全是 0%，研究员据网页高点报了 10 条「冲突」
+  return `价格序列：${c.months ?? '—'} 个月点，${c.from || '—'} → ${c.to || '—'}（月末收盘采样，${adj}，来源 ${pack.source}）`
     + (pack.adjusted ? '' : `；⚠ ${pack.reason}`);
 }

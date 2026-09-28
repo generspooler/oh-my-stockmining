@@ -45,10 +45,13 @@ function aggregates(annuals) {
   const f = fScore(annuals);
   const roes = annuals.map((r) => r.roe).filter((x) => x != null);
   const margins = annuals.map((r) => r.grossMargin).filter((x) => x != null);
+  // 「累计 FCF / 净利润」的分子分母必须取**同一批年份**（v0.11.3）。
+  // 此前分子只累计有 FCF 的年份、分母累计所有有净利润的年份：实测 APP 显示 0.83，
+  // 同年配对后是 2.51（FY2025 缺 FCF，净利润却被算进分母），BLK 0.58 → 0.73。
   let sumFcf = 0, sumNp = 0, nFcf = 0;
   for (const r of annuals) {
-    if (r.fcff != null) { sumFcf += r.fcff; nFcf++; }
-    if (r.parentNetProfit != null) sumNp += r.parentNetProfit;
+    if (r.fcff == null || r.parentNetProfit == null) continue;
+    sumFcf += r.fcff; sumNp += r.parentNetProfit; nFcf++;
   }
   return {
     years: n,
@@ -60,6 +63,7 @@ function aggregates(annuals) {
     revenueCagr: cagr(t.revenue, oldest.revenue, n - 1),
     profitCagr: cagr(t.parentNetProfit, oldest.parentNetProfit, n - 1),
     cumFcfToProfit: nFcf >= 2 && sumNp > 0 ? sumFcf / sumNp : null,
+    cumFcfYears: nFcf || null,   // 配对成功的年份数：低于年报期数时这个比值只覆盖那几年
   };
 }
 

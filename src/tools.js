@@ -49,7 +49,8 @@ export const TOOL_DEFS = [
     name: 'get_statements',
     description: '取最近 12 期报表的关键行（营收/毛利/营业利润/净利/经营现金流/资本开支/'
       + '总资产/净资产/有息负债/现金/存货/应收）。用于验证趋势与现金流质量。'
-      + 'A股 含季报（累计口径）；美股为 12 期年报 + 最近 8 个单季（单季只有利润表）。',
+      + 'A股 含季报（累计口径）；美股为 12 期年报 + 最近 8 个单季利润表 + 最近 6 期资产负债表。'
+      + '美股单季带基本/稀释 EPS 与非经营损益占税前比例——占比高说明利润有一部分不是主营赚来的。',
     input_schema: {
       type: 'object',
       properties: { code: { type: 'string' } },
@@ -150,7 +151,26 @@ async function statementsText(row) {
     for (const [label, key] of [['营收', 'revenue'], ['毛利', 'grossProfit'], ['营业利润', 'operateProfit'], ['归母净利', 'parentNetProfit']]) {
       L.push([label.padEnd(12), ...q.map((r) => yi(r[key] ?? (key === 'parentNetProfit' ? r.netProfit : null)).padStart(12))].join(''));
     }
-    L.push(['EPS'.padEnd(12), ...q.map((r) => f(r.eps).padStart(12))].join(''));
+    // v0.11.3：稀释 EPS 此前没映射（美股 004017004），「其他收入(支出)」也被整行丢弃——
+    // 实测 2026Q2 GOOGL 的非经营损益占税前 71%、AMZN 66%，PE(TTM) 被它压得很低，模型却看不到
+    L.push(['EPS基本'.padEnd(12), ...q.map((r) => f(r.eps).padStart(12))].join(''));
+    L.push(['EPS稀释'.padEnd(12), ...q.map((r) => f(r.epsDiluted).padStart(12))].join(''));
+    const share = q.map((r) => (r.totalProfit != null && r.totalProfit > 0 && r.operateProfit != null
+      ? `${(((r.totalProfit - r.operateProfit) / r.totalProfit) * 100).toFixed(0)}%` : '—'));
+    if (share.some((x) => x !== '—')) {
+      L.push(['非经营/税前'.padEnd(12), ...share.map((x) => x.padStart(12))].join(''));
+      L.push('（非经营损益 = 税前利润 − 营业利润：利息、投资收益、其他收支；占比高时 PE 会被它压低）');
+    }
+  }
+  // 季度资产负债表（v0.11.3）：此前只有年报，于是「最新季度利润 + 两年前的应收存货」一起被引用
+  const bal = (st?.balances || []).slice(0, 6);
+  if (!cn && bal.length) {
+    L.push('', `最近 ${bal.length} 期资产负债表（时点值，新→旧）`);
+    L.push(['科目'.padEnd(12), ...bal.map((r) => String(r.period).padStart(12))].join(''));
+    for (const [label, key] of [['总资产', 'totalAssets'], ['净资产', 'parentEquity'], ['货币资金', 'cash'],
+      ['存货', 'inventory'], ['应收', 'ar'], ['商誉', 'goodwill']]) {
+      L.push([label.padEnd(12), ...bal.map((r) => yi(r[key]).padStart(12))].join(''));
+    }
   }
   return L.join('\n');
 }
@@ -292,8 +312,11 @@ async function priceSeriesText(row) {
   const cur = row.market === 'cn' ? '¥' : '$';
   const L = [
     `${row.name}（${row.code}）月线收盘，最近 ${use.length} 个月（${pack.source}，已按现价重新锚定）`,
-    `口径：已剔除拆股与分红的影响，末点 = 现价 ${cur}${f(row.price)}。`
-    + '这不是当时的实际成交价，而是可直接相互比较的价格轨迹。',
+    pack.adjusted
+      ? `口径：已复权（复权来源 ${pack.source}），末点 = 现价 ${cur}${f(row.price)}。`
+        + '这不是当时的实际成交价，而是可直接相互比较的价格轨迹。'
+      : `口径：⚠ **未复权**（${pack.reason || '复权序列不可得'}）。`
+        + '末点 = 现价，但更早的点含拆股与分红的影响，不能直接当作当时的实际成交价。',
   ];
   for (let i = 0; i < use.length; i += 6) {
     L.push('  ' + use.slice(i, i + 6).map((r) => `${r.date.slice(0, 7)} ${f(r.close * anchor, 2)}`).join('　'));

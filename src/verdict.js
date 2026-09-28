@@ -20,7 +20,7 @@ import {
 } from './llm.js';
 import { renderProfile } from './deep.js';
 import { buildTools, withTranscript } from './tools.js';
-import { resolveAnchor } from './valuation.js';
+import { resolveAnchor, requiredMos } from './valuation.js';
 import { runResearch, renderResearch, compactResearch } from './research.js';
 import { SCREENING, NARRATIVE } from './config.js';
 
@@ -224,8 +224,19 @@ export function capTop(top, topN) {
     .map((x, i) => ({ ...x, rank: i + 1 }));
 }
 
-/** 模型是否把这只标为「未达标」。缺省视为达标——旧提示词与旧快照没有这个字段。 */
-export const isBelowBar = (x) => x?.meetsBar === false || /^(false|否|no)$/i.test(String(x?.meetsBar ?? '').trim());
+/**
+ * 模型是否把这只标为「未达标」。只有**明确的否**才算补位，其余（缺字段、写「不达标」「N」
+ * 这类没列进来的写法）一律按达标处理——v0.11.3 的取舍：宁可让一只其实不达标的票留在榜上
+ * 并被渲染层照常展示，也不要让代码在模型没犯错时把它踢出榜单（席位由模型排序，代码不替它排序）。
+ * 旧提示词与旧快照没有这个字段，整个字段缺失时必然落在这一侧。
+ */
+const BELOW_BAR = /^(false|no|n|0|否|不|不是|未达标|不达标|没达标)$/i;
+export const isBelowBar = (x) => {
+  const v = x?.meetsBar;
+  if (v === false) return true;
+  if (typeof v === 'string') return BELOW_BAR.test(v.trim());
+  return false;
+};
 
 /**
  * 榜单席位裁定（纯函数，可测）：min ~ max 席，两条铁律由代码保证而非寄望于模型：
@@ -282,7 +293,19 @@ export function normalizeExternal(list, known) {
  * known 是 代码 → 档案。没有 anchors 的档案（旧数据、单测桩）返回 valuation:null，不抛。
  */
 export function withValuation(board, known) {
-  const fill = (x) => ({ ...x, valuation: resolveAnchor(x.anchor, known.get(key(x.code))?.anchors) });
+  const fill = (x) => {
+    const p = known.get(key(x.code));
+    const valuation = resolveAnchor(x.anchor, p?.anchors);
+    // 「低于参考门槛」只标注（v0.11.3）：模型判了达标、但按 F-Score 分档的要求安全边际
+    // 还差一截时，把这个差额摆到界面上，由人判断——代码不改判（用户取向：减少机械规则）。
+    // 反之不标：高于门槛不代表这只票就好，门槛只是一个参照。
+    let belowRequiredMos = null;
+    const req = requiredMos(p?.fScore);
+    if (valuation?.mos != null && req != null && valuation.mos < req - SCREENING.valuation.lowMosSlack) {
+      belowRequiredMos = { actual: Number(valuation.mos.toFixed(4)), required: req, fScore: p?.fScore ?? null };
+    }
+    return { ...x, valuation, belowRequiredMos };
+  };
   return { ...board, top: (board.top || []).map(fill) };
 }
 
@@ -544,6 +567,8 @@ export async function finalVerdict(profiles, {
   return {
     ok: true, model: final.model,
     top: final.top, rejected: final.rejected, note: final.note,
+    // 同一份榜单在实时与回放里必须带着同一批状态字段（v0.11.3）
+    unanswered: final.rejected.filter((x) => x.unanswered).length,
     topN, minN: Math.min(minN, profiles.length),
     externalNotes, suspectNumbers: final.suspectNumbers,
     calls, toolCalls: deep.toolCalls || 0, toolLog: deep.toolLog || [],

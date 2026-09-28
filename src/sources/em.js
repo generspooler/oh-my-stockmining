@@ -319,7 +319,7 @@ const US_ITEM = {
   '004009999': 'operateProfit', '004011999': 'totalProfit',
   '004013001': 'incomeTax', '004013999': 'netProfit',
   '004015999': 'parentNetProfit', '004015096': 'parentNetProfit',
-  '004017003': 'eps', '004017007': 'sharesBasic', '004017008': 'sharesDiluted',
+  '004017003': 'eps', '004017004': 'epsDiluted', '004017007': 'sharesBasic', '004017008': 'sharesDiluted',
 };
 const US_BAL_ITEM = {
   '004005999': 'totalAssets', '004011999': 'totalLiab',
@@ -340,6 +340,19 @@ async function usReport(reportName, code, reportType) {
     }, { maxPages: 8, pageSize: 500 }));
 }
 
+// 季度资产负债表（v0.11.3）：只取这几个科目、只取 2016 年起，一页（500 行）就能装下约 40 期。
+// 全科目全期间要翻十几页，44 只一轮就是几百次请求。
+const US_BAL_QUARTER_ITEMS = ['004017999', '004013999', '004001008', '004001004', '004001001',
+  '004005999', '004011999', '004007007', '004009005', '004007008', '004003004'];
+
+async function usBalanceAllPeriods(code) {
+  return cached(`usstmt:RPT_USF10_FN_BALANCE:${code}:季度科目`, CACHE_TTL.statement, () =>
+    dcAll({
+      reportName: 'RPT_USF10_FN_BALANCE', columns: 'ALL', sortTypes: -1, sortColumns: 'REPORT_DATE',
+      filter: `(SECUCODE="${code}")(STD_ITEM_CODE in (${US_BAL_QUARTER_ITEMS.map((c) => `"${c}"`).join(',')}))(REPORT_DATE>='2016-01-01')`,
+    }, { maxPages: 3, pageSize: 500 }));
+}
+
 /** 把长表按报告期透视成宽表。 */
 function pivotUs(rows, dict) {
   const byPeriod = new Map();
@@ -347,20 +360,25 @@ function pivotUs(rows, dict) {
     const p = d10(r.REPORT_DATE);
     const key = dict[r.STD_ITEM_CODE];
     if (!p || !key) continue;
-    if (!byPeriod.has(p)) byPeriod.set(p, { period: p, currency: r.CURRENCY_ABBR || 'USD' });
+    if (!byPeriod.has(p)) byPeriod.set(p, { period: p, currency: r.CURRENCY_ABBR || 'USD', reportType: r.REPORT_TYPE || null });
     const v = n(r.AMOUNT);
     if (v != null && byPeriod.get(p)[key] == null) byPeriod.get(p)[key] = v;
   }
   return byPeriod;
 }
 
-/** 美股财报。annual=年报（归一化用），quarterly=单季报（TTM 用）。 */
+/**
+ * 美股财报。annual=年报（归一化用），quarterly=单季报（TTM 用），
+ * balances=各期资产负债表时点值（年报 + 季报，v0.11.3；PB 历史与最新营运资本用）。
+ * balances 取不到时为空数组，调用方退回年报——它是补充，不能让整份报表失败。
+ */
 export async function statementsUS(code, suffix = 'O') {
   const su = `${String(code).toUpperCase()}.${suffix}`;
-  const [incA, incQ, balA] = await Promise.all([
+  const [incA, incQ, balA, balAll] = await Promise.all([
     usReport('RPT_USF10_FN_INCOME', su, '年报'),
     usReport('RPT_USF10_FN_INCOME', su, '单季报'),
     usReport('RPT_USF10_FN_BALANCE', su, '年报'),
+    usBalanceAllPeriods(su).catch(() => null),
   ]);
   const merge = (incMap, balMap) => {
     for (const [p, v] of balMap) {
@@ -372,6 +390,7 @@ export async function statementsUS(code, suffix = 'O') {
   return {
     annual: merge(pivotUs(incA, US_ITEM), pivotUs(balA, US_BAL_ITEM)),
     quarterly: [...pivotUs(incQ, US_ITEM).values()].sort((a, b) => (a.period < b.period ? 1 : -1)),
+    balances: [...pivotUs(balAll || [], US_BAL_ITEM).values()].sort((a, b) => (a.period < b.period ? 1 : -1)),
   };
 }
 

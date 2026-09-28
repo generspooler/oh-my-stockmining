@@ -421,6 +421,10 @@ async function openHist(i){
           picks:(d.candidates||[]).filter(c=>!c.isWatch).length,batches:d.coarse}));
       out.insertAdjacentHTML('beforeend',renderTop({scope:d.scope||'market',
         verdict:{ok:true,top:d.top||[],note:d.note,rejected:d.rejected||[],minN:d.minN??null,
+          // 本轮状态（v0.11.3）：回放必须与实时同屏信息一致，否则「历史回放」看着比当时更干净
+          suspectNumbers:d.suspectNumbers||[],budgetExhausted:d.budgetExhausted||false,
+          batchFailed:d.batchFailed||[],unanswered:d.unanswered||0,promoted:d.promoted||[],
+          shortlist:d.shortlist??null,
           externalNotes:d.externalNotes||[],toolLog:d.toolLog||[],toolCalls:d.toolCalls||0,
           toolsDisabled:d.toolsDisabled,phases:d.phases||null,research:d.research||null,
           quotas:d.quotas||null,pool:(d.candidates||[]).length},
@@ -724,6 +728,14 @@ function renderTop(d){
         ? ` <span class="dim">自选组 ≤${v.quotas.watch} + 市场组 ≤${v.quotas.market}（旧版混排快照）</span>`
         : ' <span class="dim">第一名默认展开，其余点击查看</span>'));
   s+=webStatus(v.research);
+  // 本轮状态（v0.11.3）：预算用尽 / 有批次整批失败 / 有票没被回答 / 数字存疑——
+  // 这些此前只活在内存里，回放出来看不出该不该信这张榜
+  const st=[];
+  if(v.budgetExhausted)st.push('<span class="y">取数预算已用尽（部分标的是带着未查完的问题下的结论）</span>');
+  if((v.batchFailed||[]).length)st.push(`<span class="y">${v.batchFailed.length} 个批次整批失败：${esc(v.batchFailed.join('；'))}</span>`);
+  if(v.unanswered)st.push(`<span class="y">${v.unanswered} 只没有拿到结论（既没进榜也没被判落选）</span>`);
+  if((v.suspectNumbers||[]).length)st.push(`<span class="y">${v.suspectNumbers.length} 个数字无法追溯到输入，已标注在对应条目上</span>`);
+  if(st.length)s+='<div class="dim" style="margin-top:6px">本轮状态：'+st.join(' · ')+'</div>';
   if(watch&&!v.top.length)
     s+='<div class="y" style="margin-top:10px">池内当前没有一只达到买入标准——这是结论，不是故障。</div>';
 
@@ -737,6 +749,9 @@ function renderTop(d){
     const mos=vo.mos+(vo.note?` <span class="dim">${esc(vo.note)}</span>`:'')
       +(vo.legacy&&x.valuationCaveat?' <span class="y" title="模型判定该机械估值口径失真，见卡内「估值提醒」">口径存疑</span>':'');
     const bb=x.meetsBar===false;
+    // 模型判达标、但按 F-Score 分档的要求安全边际还差一截（v0.11.3）：只标注，不改判
+    const lm=x.belowRequiredMos;
+    const lmTag=lm?` <span class="y" title="所选锚的安全边际低于同 F-Score 的参考门槛，由模型判定达标——参考门槛只作参照">低于参考门槛 ${pct(lm.actual)}&lt;${pct(lm.required)}</span>`:'';
     const first=String(x.thesis||x.belowBarReason||'').split(/(?<=[。！？])/)[0]||'';
     // 自选榜标「不在挖掘池内」（口径适配有限）；市场榜标「已自选」（这只你在盯）
     const grp=watch?(p.outOfPool?'<span class="grp grpM">不在挖掘池内</span>':'')
@@ -745,10 +760,11 @@ function renderTop(d){
     s+=`<details class="pick"${i===0?' open':''}>
       <summary>
         <div class="pickL">
-          <span class="nm2">${x.rank}. ${esc(p.name||x.code)} ${grp}${bb?' <span class="grp grpB">未达标 · 机制补位</span>':''}</span>
+          <span class="nm2">${x.rank}. ${esc(p.name||x.code)} ${grp}${bb?' <span class="grp grpB">未达标 · 机制补位</span>':''}${lmTag}</span>
           <span class="dim"> ${esc(x.code)} · ${esc(p.industry||'')}</span>
           <span class="caret">▶</span>
           <div class="one">${esc(first)}</div>
+          ${x.suspectNumbers&&x.suspectNumbers.length?`<div class="y">⚠ 有 ${x.suspectNumbers.length} 个数字无法追溯到输入，请自行核实</div>`:''}
         </div>
         <div class="pickR">
           <div>${cur2}${n(p.price)}</div>
@@ -794,6 +810,7 @@ function renderTop(d){
             <span class="dim"> ${esc(x.code)} · ${esc(p.industry||'')}</span>
             <span class="caret">▶</span>
             <div class="one">${esc(first)}</div>
+          ${x.suspectNumbers&&x.suspectNumbers.length?`<div class="y">⚠ 有 ${x.suspectNumbers.length} 个数字无法追溯到输入，请自行核实</div>`:''}
           </div>
           <div class="pickR">
             <div>${cur2}${n(p.price)}</div>
