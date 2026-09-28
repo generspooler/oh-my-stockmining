@@ -71,6 +71,17 @@ export function renderSingle(r, attribution) {
         if (x.why) out.push(`    ${C.dim}依据：${x.why}${C.r}`);
       }
     }
+    // 联网研究（v0.11.0）：网络来源，与实测结论分开呈现
+    const web = attribution.research;
+    if (web?.findings?.length) {
+      const f = web.findings[0];
+      out.push(`\n${C.y}联网研究（网络来源，未经本系统核实${f.confidence ? `，研究员自评可信度 ${f.confidence}` : ''}）：${C.r}`);
+      if (f.summary) out.push(`  ${f.summary}`);
+      for (const e of f.events) out.push(`  ${C.dim}· ${e.date || '日期不明'} ${e.source || ''}｜${e.claim || e.title || ''}  ${e.url}${C.r}`);
+      for (const c of f.conflicts) out.push(`  ${C.y}⚠ 与给定数据冲突：${c.claim}${C.r}`);
+    } else if (web && !web.skipped) {
+      out.push(`${C.y}⚠ 联网研究未完成：${web.reason}${C.r}`);
+    }
     if (attribution.toolsDisabled) out.push(`${C.y}⚠ 取数工具不可用（渠道不支持），本次仅基于机械层档案${C.r}`);
     if (attribution.suspectNumbers?.length) {
       out.push(`${C.y}⚠ 以下数字无法追溯到输入数据，请自行核实：${attribution.suspectNumbers.map((x) => x.value).join('、')}${C.r}`);

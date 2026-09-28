@@ -1,4 +1,4 @@
-// 估值层（SYSTEM_DEFINITION §2.3 / §2.4）：分位 → 三档区间 → 档位 → 安全边际 → 置信度。
+// 估值层（SYSTEM_DEFINITION §2.3 / §2.4）：分位 → 估值锚 / 三档区间 → 档位 → 安全边际 → 置信度。
 // 这是 §2.3 的唯一实现处，代码必须严格照此，其他模块不得自行折算估值。
 import { percentile, percentileRankOf, median, safeDiv, daysBetween } from './util.js';
 import { SCREENING } from './config.js';
@@ -19,7 +19,10 @@ export async function multipleSeries(stock) {
     return {
       source: '东财估值序列', freq: 'daily',
       shares: s[0]?.shares ?? null,
-      rows: s.map((r) => ({ date: r.date, pe: r.pe, pb: r.pb, ps: r.ps, close: r.close })),
+      rows: s.map((r) => ({
+        date: r.date, close: r.close,
+        pe: r.pe, peLar: r.peLar, pb: r.pb, ps: r.ps, pcf: r.pcf, pcfLar: r.pcfLar, peg: r.peg,
+      })),
     };
   }
   return reverseUsSeries(stock);
@@ -96,21 +99,28 @@ const shiftDays = (period, n) => {
  * 分位倍数。窗口取近 windowDays 个交易日；剔除负值与 >99 分位的极端点。
  * 序列不足 minWindowDays → 标记 insufficient，调用方强制降置信度。
  */
+/** 分位窗口：近 windowDays 个交易日（月频按 12/250 换算）。 */
+function windowOf(rows, freq) {
+  const windowN = freq === 'monthly' ? Math.round((V.windowDays / 250) * 12) : V.windowDays;
+  return (rows || []).slice(0, windowN);
+}
+
 export function multiplePercentiles(rows, field, freq = 'daily') {
   // 窗口与年数都必须按频率换算：月频 120 点是 10 年，按日频公式会算成 0.5 年
   const perYear = freq === 'monthly' ? 12 : 250;
-  const windowN = freq === 'monthly' ? Math.round((V.windowDays / 250) * 12) : V.windowDays;
   const minN = freq === 'monthly' ? Math.round((V.minWindowDays / 250) * 12) : V.minWindowDays;
-  const win = (rows || []).slice(0, windowN);
+  const win = windowOf(rows, freq);
   let vals = win.map((r) => r[field]).filter((x) => x != null && isFinite(x) && x > 0);
   if (!vals.length) return { ok: false, reason: `${field} 序列为空` };
+  // 被剔除的点（缺失或 ≤0，即亏损期 / 净资产为负）要如实计数：它是「这个锚失真没有」的直接证据
+  const excluded = win.length - vals.length;
   const cap = percentile(vals, V.outlierPct);
   vals = vals.filter((x) => x <= cap);
   const years = win.length / perYear;
   return {
     ok: true,
     p25: percentile(vals, 25), p50: percentile(vals, 50), p75: percentile(vals, 75),
-    n: vals.length, years,
+    n: vals.length, years, window: win.length, excluded,
     insufficient: win.length < minN,
     field,
   };
@@ -153,6 +163,111 @@ export function tierOf(pv) {
   const idx = i < 0 ? SCREENING.tiers.length - 1 : i;
   return { index: idx, name: SCREENING.tiers[idx].name };
 }
+
+// ── 估值锚（v0.10.0，§2.3 步骤 3）───────────────────────────────
+// 机械层**不判股性、不选锚**：把能算的锚全部并排给模型，各带失真诊断（事实，不是判定），
+// 由模型判断股性后选一个，或判定都不可信。此前的「周期股 → PB」路由已删除。
+//
+// 倍数优先用**接口原值**（用户决策 2026-09-26：能从接口拿到的不自己重算）：
+//   A股：当前值与 5 年历史都来自东财 RPT_VALUEANALYSIS_DET（逐日）；
+//   美股：当前 PE(TTM)/PB 来自东财行情列表；历史分位接口没有，只能反算（腾讯月线 × SEC 报表）。
+// 唯一必须自己算的是「归一化 PE」：它是一个分析假设（利润率回归 7 年中位），不是接口字段。
+
+export const ANCHOR_DEFS = [
+  { key: 'pe', label: 'PE(TTM)', field: 'pe' },
+  { key: 'pe_lar', label: 'PE(静态)', field: 'peLar' },
+  { key: 'pb', label: 'PB', field: 'pb' },
+  { key: 'ps', label: 'PS(TTM)', field: 'ps' },
+  { key: 'pcf', label: 'PCF(经营现金流TTM)', field: 'pcf' },
+];
+/** 美股反算序列只有这三个字段 */
+const US_KEYS = new Set(['pe', 'pb', 'ps']);
+
+/**
+ * 单个倍数锚：现值在自身 5 年历史里的位置。P/V = 现值 ÷ 5 年中位（与「每股口径 × 中位倍数」
+ * 的旧算法数学上等价，但每股口径不必自己重算）。prices 只是同一组接口数字的换算。
+ */
+export function multipleAnchor(def, { rows, freq = 'daily', current, price, from }) {
+  const base = { key: def.key, label: def.label, from };
+  if (current == null || !isFinite(current)) return { ...base, ok: false, reason: '无当前值' };
+  if (current <= 0) return { ...base, ok: false, current, reason: '当前值 ≤ 0（亏损或净资产为负），该倍数无意义' };
+  const pc = multiplePercentiles(rows, def.field, freq);
+  if (!pc.ok) return { ...base, ok: false, current, reason: pc.reason };
+  const win = windowOf(rows, freq).map((r) => r[def.field]).filter((x) => x != null && isFinite(x) && x > 0);
+  const pv = current / pc.p50;
+  return {
+    ...base, ok: true, current,
+    p25: pc.p25, p50: pc.p50, p75: pc.p75,
+    years: pc.years, n: pc.n, window: pc.window, excluded: pc.excluded, insufficient: pc.insufficient,
+    rank: percentileRankOf(win, current),
+    pv, tier: tierOf(pv),
+    prices: price ? { p25: (price * pc.p25) / current, p50: (price * pc.p50) / current, p75: (price * pc.p75) / current } : null,
+  };
+}
+
+/** 归一化 PE 锚（系统推算）：现价 ÷ 归一化 EPS，与 PE(TTM) 的 5 年分位对照。 */
+export function normalizedPeAnchor({ rows, freq = 'daily', norm, price, from }) {
+  const base = { key: 'pe_norm', label: '归一化PE', from };
+  if (!norm?.ok) return { ...base, ok: false, reason: norm?.reason || '归一化不可用' };
+  if (!(norm.normEps > 0)) return { ...base, ok: false, reason: '归一化 EPS ≤ 0' };
+  if (!(price > 0)) return { ...base, ok: false, reason: '现价不可得' };
+  const a = multipleAnchor({ key: 'pe_norm', label: '归一化PE', field: 'pe' }, {
+    rows, freq, current: price / norm.normEps, price, from,
+  });
+  return { ...a, normEps: norm.normEps, normMargin: norm.normMargin };
+}
+
+/**
+ * 一只票的全部估值锚。series 是 multipleSeries() 的返回（A股接口逐日 / 美股反算月频）。
+ * 返回数组，顺序固定；不可算的锚也保留（ok:false + reason），让模型知道「为什么没有它」。
+ */
+export function anchorsFor({ row, series, norm, market }) {
+  const rows = series?.rows || [];
+  const freq = series?.freq || 'daily';
+  const latest = rows[0] || {};
+  const price = row?.price ?? latest.close ?? null;
+  const out = [];
+  for (const def of ANCHOR_DEFS) {
+    if (market === 'us' && !US_KEYS.has(def.key)) continue;
+    let current = latest[def.field] ?? null;
+    let from = market === 'cn' ? '接口' : '反算';
+    // 美股 PE(TTM)/PB 的**当前值**东财行情列表直接给，优先用接口值；历史仍是反算
+    if (market === 'us' && (def.key === 'pe' || def.key === 'pb') && row?.[def.key] != null) {
+      current = row[def.key];
+      from = '接口现值 · 反算历史';
+    }
+    if (market === 'cn' && current == null && (def.key === 'pe' || def.key === 'pb')) current = row?.[def.key] ?? null;
+    out.push(multipleAnchor(def, { rows, freq, current, price, from }));
+  }
+  out.push(normalizedPeAnchor({ rows, freq, norm, price, from: market === 'cn' ? '系统推算 · 接口历史' : '系统推算 · 反算历史' }));
+  return out;
+}
+
+/**
+ * 把模型选的锚解析成可展示的估值（纯函数，可测）。数字一律取自机械层算好的锚，
+ * 模型只负责「选哪个」——延续「数字由代码算」的铁律。
+ *   null        → 模型没选（旧提示词 / 旧快照 / 代码补位条目）
+ *   {key:'none'} → 模型判定各锚都不可信：渲染层不显示安全边际数字
+ *   {invalid}   → 模型选了档案里没有、或不可算的锚
+ */
+export function resolveAnchor(choice, anchors) {
+  if (choice == null || String(choice).trim() === '') return null;
+  const norm = (s) => String(s).trim().toLowerCase().replace(/[\s()（）]/g, '');
+  const k = norm(choice);
+  if (/^(none|无|都不可信|不可信|均不可信|n\/a)$/.test(k)) return { key: 'none' };
+  const hit = (anchors || []).find((a) => a.key === k || norm(a.label) === k);
+  if (!hit) return { key: String(choice).trim(), invalid: true, reason: '档案里没有这个锚' };
+  if (!hit.ok) return { key: hit.key, label: hit.label, invalid: true, reason: hit.reason };
+  return {
+    key: hit.key, label: hit.label, from: hit.from,
+    current: hit.current, p50: hit.p50, pv: hit.pv, mos: actualMos(hit.pv), tier: hit.tier.name,
+  };
+}
+
+/** 落盘 / 推给前端的精简形态：不带分位窗口原始数据。 */
+export const compactAnchors = (anchors) => (anchors || []).map((a) => (a.ok
+  ? { key: a.key, label: a.label, ok: true, from: a.from, current: a.current, p50: a.p50, rank: a.rank, pv: a.pv, tier: a.tier?.name }
+  : { key: a.key, label: a.label, ok: false, reason: a.reason }));
 
 // v0.3 起安全边际不再是淘汰闸门，只作为「按传统标准需要多深折价」的参考值展示给模型。
 // 标定说明：格雷厄姆的 30% 对标的是保守估算的内在价值；本系统的中性值是

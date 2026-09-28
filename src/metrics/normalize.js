@@ -127,41 +127,64 @@ export function normalizedRoe(statements, market) {
 }
 
 /**
- * 周期股判定（§2.3 步骤 3）：近 7 年营业利润率变异系数 > 0.5，或营收同比曾超 ±25%。
- * 周期股主倍数切换为 PB —— 因为周期底部 PE 完全失真。
+ * 股性证据（v0.10.0，§2.3 步骤 3）：逐年的营业利润率 / 营收同比 / ROE，**只陈列、不判定**。
+ *
+ * 此前这里是 isCyclical()：利润率变异系数 > 0.5 或营收同比曾超 ±25% 即判周期股、
+ * 主倍数切成 PB。实测 A股 55 只非金融候选被判周期 35 只（64%）——迈瑞医疗、金山办公、
+ * 豪迈科技都因「某一年营收涨超 25%」入选；世纪华通因 2022 年一笔商誉减值（营业利润率
+ * −54%）把变异系数拉到 3.44。35 只里 25 只换口径后档位不同，8 只相差 ≥2 档。
+ * 调阈值救不回来（「去掉最差一年」能纠正世纪华通，却会放掉真周期股盐湖股份），
+ * 因为股性本是商业判断：利润由什么驱动、会不会均值回归。所以机械层只给事实，判断交给模型。
  */
-export function isCyclical(statements, market) {
+export function fundamentalHistory(statements, market) {
   const rows = annualRows(statements, market);
-  if (rows.length < 3) return { cyclical: false, reason: '样本不足' };
-  const margins = rows.map((r) => safeDiv(ebitOf(r, market), r.revenue)).filter((x) => x != null);
-  const { cv } = { cv: (a) => { const m = a.reduce((s, x) => s + x, 0) / a.length;
-    if (m <= 0) return null;
-    const sd = Math.sqrt(a.reduce((s, x) => s + (x - m) ** 2, 0) / (a.length - 1));
-    return sd / m; } };
-  const marginCv = margins.length >= 3 ? cv(margins) : null;
-  // 营收同比波动
-  // 上行与下行波动分开统计：真周期是「大涨也大跌」，单边高增长不是周期。
-  const revs = rows.map((r) => r.revenue).filter((x) => x != null);
-  let maxUp = 0, maxDown = 0;
-  for (let i = 0; i < revs.length - 1; i++) {
-    const yoy = safeDiv(revs[i] - revs[i + 1], Math.abs(revs[i + 1]));
-    if (yoy == null) continue;
-    if (yoy > 0) maxUp = Math.max(maxUp, yoy); else maxDown = Math.max(maxDown, -yoy);
-  }
-  const maxSwing = Math.max(maxUp, maxDown);
-  const byCv = marginCv != null && marginCv > V.cyclicalCV;
-  const bySwing = maxSwing > V.cyclicalRevSwing;
-  // 只有上行波动大、没有像样的下行 —— 更像高增长而非周期。
-  // 机械层不裁决这类案例，交给模型（§2.3 步骤 3 补充）。
-  const ambiguous = bySwing && !byCv && maxDown < 0.15;
+  if (!rows.length) return null;
+  const pct = (v) => (v == null || !isFinite(v) ? null : v);
   return {
-    cyclical: byCv || bySwing,
-    ambiguous,
-    marginCv, maxRevSwing: maxSwing, maxUpSwing: maxUp, maxDownSwing: maxDown,
-    reason: byCv ? `利润率变异系数 ${marginCv.toFixed(2)} > ${V.cyclicalCV}`
-      : ambiguous ? `营收曾涨 ${(maxUp * 100).toFixed(0)}% 但最大跌幅仅 ${(maxDown * 100).toFixed(0)}% —— 像高增长而非周期，口径待模型裁决`
-      : bySwing ? `营收同比最大波动 ${(maxSwing * 100).toFixed(0)}% > ${V.cyclicalRevSwing * 100}%` : '稳定',
+    years: rows.map((r) => String(r.period || '').slice(0, 4)),
+    margin: rows.map((r) => pct(safeDiv(ebitOf(r, market), r.revenue))),
+    revYoy: rows.map((r, i) => (i + 1 < rows.length
+      ? pct(safeDiv((r.revenue ?? NaN) - (rows[i + 1].revenue ?? NaN), Math.abs(rows[i + 1].revenue ?? NaN)))
+      : null)),
+    roe: rows.map((r) => pct(safeDiv(r.parentNetProfit ?? r.netProfit, r.parentEquity ?? r.equity))),
   };
+}
+
+/**
+ * 最近单季趋势（v0.11.0，美股）：年报之后发生的事，此前模型一个季度都看不到——
+ * 东财单季报早已取回（statementsUS().quarterly），档案却只渲染年报，工具也只给年报。
+ * 实测 APP：最近一份 10-K 是 2026-02，而 2026Q2 已披露（营收同比 +52%），模型却说
+ * 「要等下一份季报」。只陈列事实：营收、营业利润率、归母净利及其同比。
+ *
+ * 同比按「约一年前的那一季」配对（±20 天），不按月日字符串：美股财年季末常是
+ * 某周六（2026-06-27 vs 2025-06-28），字符串相等会让一半公司配不上。
+ * A股单季报是累计口径（另有 get_main_indicators），此处只处理美股，A股返回 null。
+ */
+export function quarterlyHistory(statements, market, { n = 8 } = {}) {
+  if (market !== 'us') return null;
+  const q = (statements?.quarterly || [])
+    .filter((r) => r?.period && (r.revenue != null || r.netProfit != null || r.parentNetProfit != null))
+    .slice()
+    .sort((a, b) => (a.period < b.period ? 1 : -1));
+  if (!q.length) return null;
+  const day = (p) => Date.parse(`${String(p).slice(0, 10)}T00:00:00Z`) / 86400e3;
+  const yearAgo = (r) => q.find((x) => Math.abs(day(r.period) - day(x.period) - 365) <= 20) || null;
+  const yoy = (a, b) => (a == null || b == null || !isFinite(a) || !isFinite(b) || b === 0 ? null : (a - b) / Math.abs(b));
+  const np = (r) => r?.parentNetProfit ?? r?.netProfit ?? null;
+  const rows = q.slice(0, n).map((r) => {
+    const prev = yearAgo(r);
+    return {
+      period: String(r.period).slice(0, 10),
+      currency: r.currency || null,
+      revenue: r.revenue ?? null,
+      revYoy: yoy(r.revenue, prev?.revenue),
+      opMargin: safeDiv(r.operateProfit ?? null, r.revenue ?? null),
+      netProfit: np(r),
+      npYoy: yoy(np(r), np(prev)),
+      eps: r.eps ?? null,
+    };
+  });
+  return { asOf: rows[0].period, rows };
 }
 
 export { ebitOf };

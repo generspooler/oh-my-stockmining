@@ -69,6 +69,10 @@ function aggregates(annuals) {
  * perStock：自选池挖掘的路径。池子只有十来只时，为它们拉 6 次整市场分页
  * （每次约 28 页）纯属浪费——改成逐股查（每只 1 次请求，缓存 7 天），
  * 自选池挖掘的耗时因此与全市场脱钩。两条路共用 mapMain，行结构完全一致。
+ *
+ * 两个分支的进度**粒度不同**（逐股是「数据源 × 只数」，整市场是按期的固定几次），
+ * 但 unit 都给 'collect'——摘要里的「源 N」在两个分支下都读得通，
+ * 细粒度的那份留在 label 上（见 progress.js 关于「单元标识与显示文本分开」的说明）。
  */
 async function collectCN(pool, onProgress, { perStock = false } = {}) {
   const periods = em.recentAnnualPeriods(6);
@@ -79,7 +83,8 @@ async function collectCN(pool, onProgress, { perStock = false } = {}) {
       const rows = await em.mainIndicators(s.code).catch(() => []);
       // 逐股接口返回季报+年报混排，这里只取年报期，与整市场路径口径一致
       byCode.set(s.code, rows.filter((r) => String(r.period || '').endsWith('-12-31')).slice(0, periods.length));
-      onProgress?.(`财务指标 ${++done}/${pool.length} 只`);
+      done += 1;
+      onProgress?.(`财务指标 ${done}/${pool.length} 只`, { unit: 'collect', key: `main:${s.code}` });
     });
   } else {
     for (let i = 0; i < periods.length; i++) {
@@ -88,7 +93,7 @@ async function collectCN(pool, onProgress, { perStock = false } = {}) {
         if (!byCode.has(r.code)) byCode.set(r.code, []);
         byCode.get(r.code).push(r);
       }
-      onProgress?.(`财务指标 ${i + 1}/${periods.length} 期`);
+      onProgress?.(`财务指标 报告期 ${periods[i]}（${i + 1}/${periods.length}）`, { unit: 'collect', key: `main:${periods[i]}` });
     }
   }
   return pool.map((s) => {
@@ -111,8 +116,11 @@ async function collectCN(pool, onProgress, { perStock = false } = {}) {
 /** 美股：SEC frames 批量取基本面（请求数只与概念×年数有关，与股票数无关）。 */
 async function collectUS(pool, onProgress) {
   const years = em.recentAnnualPeriods(6).map((p) => Number(p.slice(0, 4)));
+  // 计数按**请求**记，不按 (年, 概念) 坐标：bulkFundamentals 的 done 就是请求序号，
+  // 6 年 × 13 概念 = 78 次，逐个都是独立请求，因此 d 本身就是合适的单元标识。
+  // 实测一轮美股 `源 82`（78 次 SEC frames + 全市场列表 + 批量行情 + 基本面 + 起跑）。
   const fund = await sec.bulkFundamentals(pool.map((s) => s.code), years, {
-    onProgress: (d, tot) => onProgress?.(`SEC frames ${d}/${tot}`),
+    onProgress: (d, tot) => onProgress?.(`SEC frames ${d}/${tot}`, { unit: 'collect', key: `sec:${d}` }),
   });
   return pool.map((s) => {
     const byYear = fund.get(s.code);
@@ -166,19 +174,24 @@ async function collectUS(pool, onProgress) {
  * 落在排除项内的打 outOfPool，渲染与提示词都要显著标注口径适配有限（§2.1）。
  * 不给时是市场挖掘：池子 = inPool 全市场，**不注入任何自选票**
  * （v0.6 两条流水线彻底分开，自选票只作为普通市场票参与粗筛竞争）。
+ *
+ * onProgress(text, detail)：detail 供活动台账记账（§5.1）。
+ * unit 是计数类别，key 是单元标识——**两者都必须给**，台账靠 key 去重才不会
+ * 把并行刷新的同一批请求重复计数。省略 detail 的老调用点行为不变（只是不计入台账）。
  */
 export async function collect(market, { onProgress, onlyCodes = null } = {}) {
   const t0 = Date.now();
   const only = onlyCodes ? new Set(onlyCodes.map((c) => String(c).toUpperCase())) : null;
   const isOnly = (s) => !!only?.has(String(s.code || '').toUpperCase());
-  onProgress?.('拉取全市场列表');
+  onProgress?.('拉取全市场列表', { unit: 'collect', key: 'universe' });
   const universe = await em.universe(market);
   const pool = only ? universe.filter(isOnly) : universe.filter((s) => inPool(s, market));
 
-  onProgress?.('批量行情与 52 周高低');
+  onProgress?.(`批量行情与 52 周高低（${pool.length} 只）`, { unit: 'collect', key: 'quotes' });
   const quotes = await tx.batchQuotes(pool.map((s) => s.code), market);
 
-  onProgress?.(only ? '财务指标（逐股）' : market === 'cn' ? '财务指标（整市场按期）' : 'SEC frames 批量基本面');
+  onProgress?.(only ? '财务指标（逐股）' : market === 'cn' ? '财务指标（整市场按期）' : 'SEC frames 批量基本面',
+    { unit: 'collect', key: 'fundamentals' });
   const base = pool.map((s) => {
     const q = quotes.get(s.code) || {};
     return {

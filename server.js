@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PORT, SHUTDOWN_GRACE_MS } from './src/config.js';
+import { compactAnchors } from './src/valuation.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(ROOT, 'public');
@@ -34,6 +35,8 @@ const slimProfiles = (profiles) => (profiles || []).map((p) => ({
   pe: p.pe, pb: p.pb, fScore: p.fScore, roe: p.roe, roeMedian5: p.roeMedian5,
   drawdowns: p.drawdowns, priceSeries: p.priceSeries || null,   // 回撤口径（§2.6）须随数据一起到前端
   band: p.band?.ok ? p.band : null, tier: p.band?.tier || null,
+  // v0.10.0：全部估值锚（精简形态），卡片按模型选的锚显示、其余并列展示
+  anchors: p.anchors ? compactAnchors(p.anchors) : undefined,
   coarseGuess: p.coarseGuess, coarseWhy: p.coarseWhy,
   isWatch: !!p.isWatch, outOfPool: !!p.outOfPool,
   newsCount: p.news?.news?.length || 0,
@@ -45,6 +48,11 @@ const slimProfiles = (profiles) => (profiles || []).map((p) => ({
  * 而向已销毁的响应流 write 会触发 'error' 事件——没有监听者就是未捕获异常，
  * 整个服务会被一次关页面带走（连带丢掉还没落盘的结果）。
  * 断开后静默丢弃后续事件，流水线照常跑完并落盘。
+ *
+ * 另外**按内容指纹去重**（§5.1）：阶段 1 的每个网络请求都会报一次进度
+ * （实测一轮 78 次 SEC frames），照发不误的话单轮就是数万条 SSE 消息。
+ * 编排层已经兜了一道（内容没变就不发），这里再按 (事件名, 内容) 判一次——
+ * 同一份文案在两个阶段各报一次是合法的，不该丢。
  */
 function sse(res) {
   res.writeHead(200, {
@@ -52,6 +60,7 @@ function sse(res) {
     'cache-control': 'no-cache', connection: 'keep-alive',
   });
   let alive = true;
+  let lastKey = '';
   const die = () => { alive = false; };
   res.on('error', die);
   res.on('close', die);
@@ -59,7 +68,10 @@ function sse(res) {
     get alive() { return alive; },
     send: (event, data) => {
       if (!alive) return false;
-      try { return res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); }
+      const key = `${event}\u0000${JSON.stringify(data)}`;
+      if (key === lastKey) return true;   // 与上一条完全相同：不重复占通道
+      lastKey = key;
+      try { return res.write(`event: ${event}\ndata: ${key.slice(event.length + 1)}\n\n`); }
       catch { alive = false; return false; }
     },
     end: () => { try { res.end(); } catch {} },
@@ -137,8 +149,14 @@ const server = http.createServer(async (req, res) => {
       ch.send('mechanical', slim);
       let a = null;
       if (llmReady()) {
-        ch.send('stage', { text: '模型归因分析中' });
-        a = await attributionPass(r, { onEvent: (e) => ch.send('llm', e) });
+        ch.send('stage', { text: '联网研究 + 模型归因分析中' });
+        // 联网研究约 1~3 分钟：它的进度要走 stage 通道，否则界面停在「模型归因分析中」一动不动
+        a = await attributionPass(r, {
+          onEvent: (e) => {
+            if (e.type === 'research') ch.send('stage', { text: e.stage === 'end' ? `${e.text}；模型归因分析中` : e.text });
+            ch.send('llm', e);
+          },
+        });
         ch.send('attribution', a);
       }
       try { saveStock({ result: r, attribution: a }); } catch {}
@@ -157,52 +175,22 @@ const server = http.createServer(async (req, res) => {
     const ch = sse(res);
     inFlight++;
     try {
-      const { collect } = await import('./src/collect.js');
-      const { coarseScreen } = await import('./src/coarse.js');
-      const { deepen } = await import('./src/deep.js');
-      const { finalVerdict } = await import('./src/verdict.js');
-      const { llmReady } = await import('./src/llm.js');
-      const { saveMine, buildMinePayload } = await import('./src/history.js');
-      const tStart = Date.now();
-
-      // stage 事件带结构化 phase/done/total，前端据此驱动进度条，
+      // 编排唯一入口，与 CLI 共用（§6.2）。落盘也在里面，网页不再各写一遍。
+      const { runMarketMine } = await import('./src/marketRun.js');
+      // stage 事件带结构化 phase/done/total + **活动快照**（§5.1）。
+      // 快照里的 act/counters/summaries/recent 让界面能显示「具体在干什么」，
+      // 而不是只有一个阶段名——阶段名在十几分钟里是不变的，等于没有进度。
       // 不必解析「阶段N · 」这种脆弱的字符串前缀。
-      const stage = (phase, text, done, total) => ch.send('stage', { phase, text, done, total });
-      stage(1, '全市场信息收集');
-      const { rows, meta } = await collect(market, { onProgress: (t) => stage(1, t) });
-      ch.send('collected', { meta, watch: null });
-
-      if (!llmReady()) {
-        ch.send('error', { message: '未检测到模型凭据：机械层已完成收集，模型推理不可用。请 export ANTHROPIC_AUTH_TOKEN 后重启服务。' });
-        return ch.end();
-      }
-
-      const coarse = await coarseScreen(rows, market, {
-        caveats: meta.caveats,
-        onProgress: (d, t, b) => stage(2, `粗筛（${b}）`, d, t),
+      const r = await runMarketMine(market, {
+        onStage: (phase, text, done, total, snap) => ch.send('stage', { phase, text, done, total, snap }),
+        onCollected: ({ meta }) => ch.send('collected', { meta, watch: null }),
+        onCoarse: (c) => ch.send('coarse', c),
+        // 此前这里压根没传 onEvent，降级与存疑事件全部静默丢弃；
+        // 现在连同深挖的取数事件一起送到前端。
+        onEvent: (e) => ch.send('llm', e),
       });
-      ch.send('coarse', {
-        calls: coarse.calls, picks: coarse.picks.length,
-        batches: coarse.results.map((r) => ({ label: r.label || r.bucket, scanned: r.scanned || 0, picked: (r.picks || []).length, note: r.note, ok: r.ok, reason: r.reason })),
-      });
-      if (!coarse.picks.length) { ch.send('done', { ok: true }); return ch.end(); }
-
-      const profiles = await deepen(coarse.picks, {
-        onProgress: (t) => {
-          const m = String(t).match(/(\d+)\/(\d+)/);
-          stage(3, t.replace(/\s*\d+\/\d+$/, ''), m ? Number(m[1]) : undefined, m ? Number(m[2]) : undefined);
-        },
-      });
-      stage(4, '总裁决');
-      const v = await finalVerdict(profiles);
-      // 落盘：此前只有 CLI 写快照，网页跑的结果全部丢失
-      try {
-        saveMine(buildMinePayload({
-          scope: 'market', market, meta, coarse, profiles, verdict: v,
-          totalMs: Date.now() - tStart, modelCalls: coarse.calls + 1,
-        }));
-      } catch {}
-      ch.send('verdict', { scope: 'market', verdict: v, profiles: slimProfiles(profiles) });
+      if (r.noCandidates) { ch.send('done', { ok: true }); return ch.end(); }
+      ch.send('verdict', { scope: 'market', verdict: r.verdict, profiles: slimProfiles(r.profiles) });
       ch.send('done', { ok: true });
     } catch (e) {
       ch.send('error', { message: e.message });
@@ -219,8 +207,10 @@ const server = http.createServer(async (req, res) => {
     try {
       const { runWatchMine } = await import('./src/watchRun.js');
       const r = await runWatchMine(market, {
-        onStage: (phase, text, done, total) => ch.send('stage', { phase, text, done, total }),
+        onStage: (phase, text, done, total, snap) => ch.send('stage', { phase, text, done, total, snap }),
         onCollected: (d) => ch.send('collected', d),
+        // 自选那条此前也漏了 onEvent：降级与取数只反映在进度文案上，不留痕
+        onEvent: (e) => ch.send('llm', e),
       });
       ch.send('verdict', {
         scope: 'watch', market, verdict: r.verdict,

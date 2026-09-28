@@ -21,7 +21,8 @@ export async function searchNews(keyword, { size = 12 } = {}) {
     uid: '', keyword, type: ['cmsArticleWebOld'], client: 'web', clientType: 'web', clientVersion: 'curr',
     param: { cmsArticleWebOld: { searchScope: 'default', sort: 'time', pageIndex: 1, pageSize: size } },
   }));
-  return cached(`news:${keyword}:${size}`, CACHE_TTL.misc, async () => {
+  // v2：摘要存 300 字（此前 180）。缓存键跟着变，否则旧缓存里还是短摘要
+  return cached(`news:v2:${keyword}:${size}`, CACHE_TTL.misc, async () => {
     const txt = await fetchText(
       `https://search-api-web.eastmoney.com/search/jsonp?cb=cb&param=${param}`,
       { headers: UA_H, retries: 2, timeout: 15000 },
@@ -30,14 +31,14 @@ export async function searchNews(keyword, { size = 12 } = {}) {
     if (!m) return [];
     let d; try { d = JSON.parse(m[1]); } catch { return []; }
     return (d?.result?.cmsArticleWebOld || []).map((x) => ({
-      date: d10(x.date), title: strip(x.title), summary: strip(x.content).slice(0, 180),
+      date: d10(x.date), title: strip(x.title), summary: strip(x.content).slice(0, 300),
       source: x.mediaName || null, url: x.url || null,
     })).filter((x) => x.title);
   });
 }
 
 /** A股个股公告（标题级，不拉全文——粗读足够，全文留给单股分析）。 */
-export async function announcements(code, { size = 10 } = {}) {
+export async function announcements(code, { size = 20 } = {}) {
   return cached(`ann:${code}:${size}`, CACHE_TTL.misc, async () => {
     const d = await fetchJson(
       `https://np-anotice-stock.eastmoney.com/api/security/ann?page_size=${size}&page_index=1&ann_type=A&client_source=web&stock_list=${code}&f_node=0&s_node=0`,
@@ -89,12 +90,12 @@ export async function newsFor(stock) {
   return { keyword: kw, news: kept, announcements: ann, fetched: raw.length, filtered: dropped };
 }
 
-/** 批量检索，受并发限制。 */
+/** 批量检索，受并发限制。onProgress(done, total, stock) 由调用方决定怎么显示。 */
 export async function fetchNews(stocks, { onProgress } = {}) {
   const out = new Map();
   await pool(stocks, Math.min(LIMITS.emConcurrency, 4), async (s) => {
     out.set(s.code, await newsFor(s).catch(() => ({ keyword: s.name, news: [], announcements: [] })));
-  }, onProgress);
+  }, (d, t) => onProgress?.(d, t, stocks[d - 1]));
   return out;
 }
 
@@ -104,11 +105,13 @@ export function renderNews(pack) {
   const lines = [];
   if (pack.news?.length) {
     lines.push(`  资讯（检索词「${pack.keyword}」，已滤除 ${pack.filtered ?? 0} 条 ETF 播报与同名机构噪音）：`);
-    pack.news.slice(0, 8).forEach((x) => lines.push(`    ${x.date || '—'} ${x.title}${x.summary ? '｜' + x.summary.slice(0, 80) : ''}`));
+    // v0.10.0 放宽（8 条 × 80 字 → 12 条 × 200 字）：实测每只档案约 1.2k token，
+    // 50 只市场裁决合计约 6 万，离 256k 预算很远；总量由 llm.js 的输入预算前置检查兜底
+    pack.news.slice(0, 12).forEach((x) => lines.push(`    ${x.date || '—'} ${x.title}${x.summary ? '｜' + x.summary.slice(0, 200) : ''}`));
   }
   if (pack.announcements?.length) {
     lines.push('  公告：');
-    pack.announcements.slice(0, 6).forEach((x) => lines.push(`    ${x.date || '—'} ${x.title}`));
+    pack.announcements.slice(0, 15).forEach((x) => lines.push(`    ${x.date || '—'} ${x.title}`));
   }
   if (lines.length) return lines.join('\n');
   const why = pack.fetched ? `检索到 ${pack.fetched} 条但全部为无关噪音` : '未检索到';

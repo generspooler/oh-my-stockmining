@@ -8,6 +8,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { ROOT } from './util.js';
+import { compactAnchors } from './valuation.js';
 
 export const SNAP_DIR = path.join(ROOT, 'snapshots');
 const INDEX = path.join(SNAP_DIR, '_index.json');
@@ -53,6 +54,9 @@ function upsert(entry) {
 export function buildMinePayload({ market, scope = 'market', meta, coarse, profiles, verdict, totalMs, modelCalls, watch }) {
   return {
     market, scope, at: new Date().toISOString(), totalMs, modelCalls, meta,
+    // 粗筛调用数单独落盘。此前前端用 modelCalls-1 反推，而 v0.7.2 起裁决是
+    // 三段而非 1 段，反推会算错——把分子直接存下来，不让读者做减法。
+    coarseCalls: coarse?.calls ?? null,
     watch: watch || null,
     coarse: (coarse?.results || []).map((r) => ({
       bucket: r.bucket, label: r.label || r.bucket, scanned: r.scanned ?? null,
@@ -63,6 +67,9 @@ export function buildMinePayload({ market, scope = 'market', meta, coarse, profi
       })),
     })),
     top: verdict?.top || [], rejected: verdict?.rejected || [],
+    // 本轮的榜单下限（v0.9.0）。补位条目的「为什么进榜」要能说出「至少几只」，
+    // 而下限可被环境变量改、会被池子大小截断，回放时不能拿当前配置去猜
+    minN: verdict?.minN ?? null,
     note: verdict?.note || null, model: verdict?.model || null,
     // 分层数字规则的 L3：模型基于自身知识的判断与质疑（§5.3）
     externalNotes: verdict?.externalNotes || [],
@@ -71,8 +78,17 @@ export function buildMinePayload({ market, scope = 'market', meta, coarse, profi
     toolLog: verdict?.toolLog || [],
     toolCalls: verdict?.toolCalls ?? 0,
     toolsDisabled: verdict?.toolsDisabled || undefined,
+    // 市场裁决的三段式概要（初排点名几只 / 深挖是否完成）。复盘时要能看出
+    // 某一轮的榜单到底有没有深挖支撑——深挖失败是允许的，但不能看不出来。
+    phases: verdict?.phases || undefined,
+    // 联网研究（v0.11.0）：逐只结论与计数。结论本身是短文本（概要、驱动、带链接的事件），
+    // 网页正文一个字都不进快照——与 toolLog 同一原则
+    research: verdict?.research || undefined,
     candidates: (profiles || []).map((p) => ({
       code: p.code, name: p.name, industry: p.industry, price: p.price,
+      // v0.10.0 起没有「主口径」：全部锚都存，模型选了哪个在 top/rejected 的 valuation 里。
+      // pv/tier 只在旧快照里有（按周期规则选的单一口径），回放时继续认
+      anchors: p.anchors ? compactAnchors(p.anchors) : undefined,
       pv: p.band?.pv ?? null, tier: p.band?.tier?.name ?? null, fScore: p.fScore,
       drawdowns: p.drawdowns,
       // 回撤口径（§2.6）。旧快照没有这个字段 → 回放时按「旧口径（未复权）」提示，
@@ -108,6 +124,7 @@ export function saveMine(payload) {
     market: payload.market, scope,
     rejected: payload.rejected?.length || 0,
     top: payload.top?.length || 0,
+    belowBar: (payload.top || []).filter((x) => x.meetsBar === false).length,
     candidates: payload.candidates?.length || 0,
     totalMs: payload.totalMs ?? null,
     modelCalls: payload.modelCalls ?? null,
@@ -139,7 +156,8 @@ export function saveStock({ result, attribution }) {
     code: s.code, name: s.name, market: s.market, industry: s.industry,
     price: result?.price ?? null,
     tier: result?.tier?.name || null,
-    mos: result?.mos?.actual ?? null,
+    // 模型选了锚就用它的安全边际；否则退回机械默认口径（v0.10.0）
+    mos: attribution?.valuation?.mos ?? result?.mos?.actual ?? null,
     attribution: attribution?.ok ? attribution.category : null,
     isTrap: attribution?.ok ? !!attribution.isTrap : null,
     hasLlm: !!attribution?.ok,
@@ -215,12 +233,13 @@ export function listHistory({ limit = 200 } = {}) {
         extras.push({ file: f, kind: 'stock', date, group, keep: false, at: d.at,
           code: d.code, name: d.name, market: d.market, industry: d.industry,
           price: d.result?.price ?? null, tier: d.result?.tier?.name || null,
-          mos: d.result?.mos?.actual ?? null,
+          mos: d.attribution?.valuation?.mos ?? d.result?.mos?.actual ?? null,
           attribution: d.attribution?.category || null, hasLlm: !!d.attribution?.ok });
       } else {
         extras.push({ file: f, kind: 'mine', date, group, keep: false, at: d.at,
           market: d.market, scope: d.scope === 'watch' ? 'watch' : 'market',
           top: d.top?.length || 0, candidates: d.candidates?.length || 0,
+          belowBar: (d.top || []).filter((x) => x.meetsBar === false).length,
           rejected: d.rejected?.length || 0,
           totalMs: d.totalMs ?? null, modelCalls: d.modelCalls ?? null, model: d.model || null });
       }

@@ -9,6 +9,10 @@
 // 模型自身知识只能进 externalNotes 并标注「未经本系统验证」。
 import { complete, completeWithTools, extractJson, validateNumbers, whitelistOf, llmReady } from './llm.js';
 import { buildTools, withTranscript } from './tools.js';
+import { renderValuation } from './deep.js';
+import { ANCHOR_RULE, ANCHOR_FIELDS, WEB_RULE } from './verdict.js';
+import { runResearch, renderResearch, compactResearch } from './research.js';
+import { resolveAnchor } from './valuation.js';
 import { NARRATIVE } from './config.js';
 
 const ATTR_CATEGORIES = ['周期性底部', '一次性事件冲击', '流动性情绪杀', '治理折价', '结构性衰退', '商业模式证伪'];
@@ -42,6 +46,8 @@ const SYS_ATTRIBUTION = `你是遵循价值投资原则的资深证券分析师�
 
 判为「结构性衰退」或「商业模式证伪」的标的将被直接剔除，请谨慎但不回避。
 
+${ANCHOR_RULE}
+
 【必须产出否决条件】写明「若 X 发生则本结论作废」。无法证伪的看多理由不予采纳。
 
 【关于数字与你自己的知识】分三层，别混：
@@ -51,10 +57,13 @@ const SYS_ATTRIBUTION = `你是遵循价值投资原则的资深证券分析师�
    系统会把它标注为「外部知识，未经本系统验证」呈现给用户。
 3. **不要**把记忆里的数字直接写进 summary / evidence 冒充实测值。
 
+${WEB_RULE}
+
 **发现给定数据有问题时请明说，不要将就着用。**
 
 输出 JSON：
 {
+  ${ANCHOR_FIELDS}
   "category": "上表六类之一",
   "isTrap": true/false,
   "confidence": "高|中|低",
@@ -81,8 +90,8 @@ function renderNumbers(result) {
   const s = result.stock;
   const lines = [
     `标的：${s.name}（${s.code}）  行业：${s.industry}  市场：${s.market === 'cn' ? 'A股' : '美股'}`,
-    `估值口径：${result.route.reason}`,
-    `档位判定：${result.tier.name}${result.tierCapped ? '（因多视角未达成一致被压制）' : ''}`,
+    `估值口径：${result.route.reason}——这只是下方估值锚之一，不代表股性判断`,
+    `档位判定（按机械默认口径）：${result.tier.name}${result.tierCapped ? '（因多视角未达成一致被压制）' : ''}`,
     `置信度：${result.confidence.level}（${result.confidence.score} 分）`,
     '',
     // 措辞随分层规则一起改：旧文案「不得使用此外的任何数值」与
@@ -90,12 +99,11 @@ function renderNumbers(result) {
     '【已知数据】机械层实测值。定量结论请用这些数字（或你用工具取回的数字）：',
   ];
   for (const [k, v] of Object.entries(result.numbers)) lines.push(`  ${k} = ${v}`);
-  if (result.routeAmbiguous && result.altBand?.ok) {
-    lines.push('', '【估值口径存疑 —— 需要你判断】');
-    lines.push(`  机械规则按「营收波动」把它归为周期股，但只有上行波动、没有像样的下行（${result.cyclical.reason}）。`);
-    lines.push(`  若它是**周期股**：用 ${result.route.primary.toUpperCase()} 口径 → 保守 ${result.band.conservative?.toFixed(2)} / 中性 ${result.band.neutral?.toFixed(2)} / 乐观 ${result.band.optimistic?.toFixed(2)}，P/V ${result.band.pv?.toFixed(3)}`);
-    lines.push(`  若它是**成长股**：用 ${result.altRoute.primary.toUpperCase()} 口径 → 保守 ${result.altBand.conservative?.toFixed(2)} / 中性 ${result.altBand.neutral?.toFixed(2)} / 乐观 ${result.altBand.optimistic?.toFixed(2)}，P/V ${result.altBand.pv?.toFixed(3)}`);
-    lines.push('  请在输出的 preferredRoute 字段里选一个，并说明理由。');
+  // v0.10.0：此前这里只在「口径存疑」时给两条口径，并要求一个没人读的 preferredRoute 字段。
+  // 现在全部锚无条件并排给出，模型用 anchor 字段选，结果由 resolveAnchor 回填成数字
+  if (result.valuationView) {
+    lines.push('', '【股性与估值锚 —— 需要你判断】');
+    for (const l of renderValuation(result.valuationView)) lines.push(`  ${l}`);
   }
   lines.push('', '【多视角判定】');
   for (const [k, v] of Object.entries(result.views)) {
@@ -104,16 +112,24 @@ function renderNumbers(result) {
   }
   if (result.cross?.conflict) lines.push(`  ⚠ ${result.cross.conflict}`);
   lines.push('', '【质量闸门】' + (result.quality?.pass === true ? '通过' : result.quality?.pass === false ? `未通过：${result.quality.failures.join('；')}` : '未评估'));
-  if (result.cyclical?.cyclical) lines.push(`【周期性】判定为周期股：${result.cyclical.reason}`);
   return lines.join('\n');
 }
 
 /**
  * pass 1 · 归因（逐只）。schema + 数字白名单校验失败则重试，仍失败标记不可用。
  */
-export async function attributionPass(result, { onEvent, useTools = true } = {}) {
+export async function attributionPass(result, { onEvent, useTools = true, research = true } = {}) {
   if (!llmReady()) return { ok: false, reason: '缺少模型凭据' };
-  const prompt = renderNumbers(result);
+  // 联网研究（v0.11.0）：单股是用户点名深挖一只，同样由一个研究员会话先查「年报之后发生了什么」。
+  // 失败不中止——没有联网结论的归因仍然是归因，提示词里会如实写明缺这一块
+  const s = result.stock || {};
+  const web = research && s.code
+    ? await runResearch([{
+      code: s.code, name: s.name, market: s.market, industry: s.industry,
+      price: result.price ?? s.price, quarters: result.valuationView?.quarters || null,
+    }], { onEvent })
+    : null;
+  const prompt = renderNumbers(result) + (web ? `\n\n${renderResearch(web, [s])}` : '');
   const rejects = [];   // 记录每次被拒的原因与原始输出，便于诊断（§5.3 不静默放行也不静默丢弃）
   // 单股的取数工具。byCode 只放这一只——模型不能把分析扩散到没收集过的标的。
   const row = { ...(result.stock || {}), price: result.price ?? result.stock?.price };
@@ -145,13 +161,15 @@ export async function attributionPass(result, { onEvent, useTools = true } = {})
       // 数字校验只标注、不丢弃：误报一次的代价是 3 次调用 + 130s，
       // 而实际风险（如把 76139300000 写成 761393000000 的单位滑位）标注出来就足够读者识别。
       // 分层数字：L1 提示词 + L2 工具返回同为白名单；L3（externalNotes）不参与校验
-      const freeText = [json.summary, ...(json.evidence || []), ...(json.risks || []), ...(json.killCriteria || [])].join(' ');
+      const freeText = [json.summary, json.anchorWhy, ...(json.evidence || []), ...(json.risks || []), ...(json.killCriteria || [])].join(' ');
       const v = validateNumbers(freeText, whitelistOf(prompt + (tr ? '\n' + tr.text() : '')));
       if (!v.ok) onEvent?.({ type: 'suspect', values: v.violations.map((x) => x.value), attempt });
       return {
         ok: true, model: r.model, ...json,
         category: category || json.category,
         categoryRaw: json.category,
+        // 模型只选锚，数字由代码按所选锚回填
+        valuation: resolveAnchor(json.anchor, result.anchors),
         categoryUnmatched: !category,
         isTrap: json.isTrap ?? (category ? TRAPS.includes(category) : false),
         externalNotes: (json.externalNotes || [])
@@ -160,13 +178,14 @@ export async function attributionPass(result, { onEvent, useTools = true } = {})
         suspectNumbers: v.violations,
         toolLog: r.toolLog || [], toolCalls: r.toolCalls || 0,
         toolsDisabled: r.toolsDisabled || undefined,
+        research: compactResearch(web),
       };
     } catch (e) {
       onEvent?.({ type: 'error', message: e.message, attempt });
-      if (attempt === NARRATIVE.schemaRetries) return { ok: false, reason: e.message };
+      if (attempt === NARRATIVE.schemaRetries) return { ok: false, reason: e.message, research: compactResearch(web) };
     }
   }
-  return { ok: false, reason: 'schema 或数字校验连续失败，标记定性分析不可用', rejects };
+  return { ok: false, reason: 'schema 或数字校验连续失败，标记定性分析不可用', rejects, research: compactResearch(web) };
 }
 
 export { renderNumbers };

@@ -90,9 +90,18 @@ test('名额配置：两市场各 50（v0.6 市场榜独占 10 席后回到 5:1 
 });
 
 test('自选榜名额与市场榜彻底独立（v0.6 分开挖掘，不再是 topN 的一半）', () => {
-  // 破掉这条说明两张榜又被耦合回去了——那正是 v0.6 要拆掉的东西
-  assert.ok(SCREENING.watch.topN > 0);
-  assert.equal(SCREENING.watch.topN, 8);
+  // 破掉这条说明两张榜又被耦合回去了——那正是 v0.6 要拆掉的东西。
+  // 两张榜各有自己的旋钮；v0.9.0 起默认值恰好相同（用户决策：都是 5~10 席）
+  assert.ok(Object.hasOwn(SCREENING.watch, 'topN') && Object.hasOwn(SCREENING.watch, 'minN'));
+  assert.equal(SCREENING.watch.topN, 10);
+  assert.equal(SCREENING.watch.minN, 5);
+});
+
+test('榜单席位 5~10（v0.9.0 用户决策 2026-09-26）：下限不得高于上限', () => {
+  assert.equal(SCREENING.topN, 10);
+  assert.equal(SCREENING.minN, 5);
+  assert.ok(SCREENING.minN <= SCREENING.topN);
+  assert.ok(SCREENING.watch.minN <= SCREENING.watch.topN);
 });
 
 test('每个批次名都有对应名额，不会静默落到 defaultPicks', () => {

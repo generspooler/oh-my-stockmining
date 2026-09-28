@@ -105,6 +105,8 @@ const PROTOCOLS = {
       if (evt.type === 'message_delta' && evt.delta?.stop_reason) {
         return { stopReason: evt.delta.stop_reason, usage: evt.usage };
       }
+      // 输入 token 数只在 message_start 里给。此前没读，于是无从核对「实际用了多少上下文」
+      if (evt.type === 'message_start' && evt.message?.usage) return { usage: evt.message.usage, meta: true };
       if (evt.type === 'error') throw new Error(evt.error?.message || '模型返回错误');
       return null;
     },
@@ -293,8 +295,68 @@ function logProtocol(model, name) {
  * onTick：节流的活性回传 { phase: 'thinking'|'writing', chars, elapsedMs }。
  * 没有它，一次 15 分钟的正常思考与真死机在上层看来完全一样（实测踩过）。
  */
+/**
+ * token 估算（纯函数）。中日韩字符按 1 字 1 token、其余按 3.5 字符 1 token——
+ * 对中文偏保守（真实约 0.6~1），宁可早收口也不撞窗口。真实用量见每次调用的 [llm] 日志行。
+ */
+export function estimateTokens(text) {
+  const s = String(text || '');
+  const cjk = (s.match(/[\u3000-\u9fff\uff00-\uffef]/g) || []).length;
+  return Math.ceil(cjk + (s.length - cjk) / 3.5);
+}
+
+/** 两套协议的输入 token 字段名不同；Anthropic 的缓存命中另计，要加回来才是真实占用。 */
+export function inputTokensOf(u) {
+  if (!u) return null;
+  if (u.input_tokens != null) return u.input_tokens + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+  return u.prompt_tokens ?? null;
+}
+const outputTokensOf = (u) => (u ? u.output_tokens ?? u.completion_tokens ?? null : null);
+
+/**
+ * 工具结果按上下文预算收口（纯函数，可测）。v0.10.0 起取代「单条结果 12000 字」一刀切：
+ * 真正要防的是**总量**——工具循环每一轮都把整段对话重发一遍，窗口是被累积撑满的。
+ *   usedTokens  本轮之前已占用的输入（上一轮真实 input_tokens 优先，否则估算）
+ * 返回 { content, truncated, full }。full=true 表示预算已满：调用方不再执行取数、撤掉工具逼出结论。
+ * 截断一律**如实告知**模型，不静默——「不让取了」与「取不到」结论不同。
+ */
+export function fitToContext(content, {
+  usedTokens, budget = NARRATIVE.context.inputTokens, reserve = NARRATIVE.context.reserveTokens,
+  maxChars = NARRATIVE.tools.maxResultChars,
+} = {}) {
+  const room = budget - reserve - (usedTokens || 0);
+  if (room < 2000) {
+    return {
+      content: `上下文预算已满（已用约 ${usedTokens} / ${budget} token）。请基于已有信息直接给出结论，不要再调用工具。`,
+      truncated: true, full: true,
+    };
+  }
+  let out = String(content ?? '');
+  let truncated = false;
+  if (out.length > maxChars) {
+    out = `${out.slice(0, maxChars)}\n…（单条结果上限 ${maxChars} 字，原 ${content.length} 字，已截断）`;
+    truncated = true;
+  }
+  const need = estimateTokens(out);
+  if (need > room) {
+    const keep = Math.max(0, Math.floor(out.length * (room / need)) - 200);
+    out = `${out.slice(0, keep)}\n…（上下文预算所限截断：剩余约 ${room} token，原 ${String(content).length} 字）`;
+    truncated = true;
+  }
+  return { content: out, truncated, full: false };
+}
+
 export async function* stream({ system, messages, model, maxTokens = NARRATIVE.maxTokens, temperature, tools, onEnd, onTick }) {
   if (!KEY) throw new Error('缺少 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY，无法调用模型');
+  // 输入预算前置检查（v0.10.0）：超了就在本地响亮失败，而不是发出去等网关回一个 400，
+  // 或者更糟——被渠道静默截断。估算偏保守（中文按 1 字 1 token）。
+  const estIn = estimateTokens(`${system || ''}\n${JSON.stringify(messages || [])}`);
+  if (estIn > NARRATIVE.context.inputTokens) {
+    const e = new Error(`输入约 ${estIn} token，超出上下文预算 ${NARRATIVE.context.inputTokens}`
+      + '（NARRATIVE.context.inputTokens / MINE_CONTEXT_TOKENS）。请分批，或在确认渠道窗口足够后调高预算');
+    e.status = 413;
+    throw e;
+  }
   const { protocol, fallbackError } = await resolveProtocol(model);
   logProtocol(model, protocol.name);
   if (fallbackError) throw fallbackError;   // 探测已失败：别用确定不可用的协议再拖一次超时
@@ -354,6 +416,8 @@ export async function* stream({ system, messages, model, maxTokens = NARRATIVE.m
         let evt; try { evt = JSON.parse(payload); } catch { continue; }
         const norm = protocol.parse(evt);
         if (!norm) continue;
+        // 纯元信息事件（只带 usage）不算产出，否则会把 anyDelta 误置真
+        if (norm.meta) { usage = { ...(usage || {}), ...norm.usage }; continue; }
         anyDelta = true;
         if (norm.text) { textChars += norm.text.length; yield norm.text; }
         else if (typeof norm.think === 'string') thinkChars += norm.think.length;
@@ -366,7 +430,7 @@ export async function* stream({ system, messages, model, maxTokens = NARRATIVE.m
           if (frag.partial) b.args += frag.partial;
         }
         if (norm.stopReason) stopReason = norm.stopReason;
-        usage = norm.usage || usage;
+        if (norm.usage) usage = { ...(usage || {}), ...norm.usage };
         tick();
       }
     }
@@ -380,15 +444,40 @@ export async function* stream({ system, messages, model, maxTokens = NARRATIVE.m
         if (b.args) { try { input = JSON.parse(b.args); } catch (e) { argsError = e.message; } }
         return { index, id: b.id, name: b.name, input, argsRaw: b.args, argsError };
       });
+    // 每次调用留一行真实用量：上下文预算是按估算设的，只有这行能校准估算
+    const inTok = inputTokensOf(usage);
+    console.log(`[llm] ${model} 输入 ${inTok ?? '?'} token（估算 ${estIn}）· 输出 ${outputTokensOf(usage) ?? '?'} token`
+      + ` · ${stopReason ?? '?'} · ${Math.round((Date.now() - t0) / 1000)}s`);
     onEnd?.({
       protocol: protocol.name, stopReason, usage, anyDelta, textChars, thinkChars,
-      toolCalls, elapsedMs: Date.now() - t0,
+      toolCalls, elapsedMs: Date.now() - t0, inputTokens: inTok, estInputTokens: estIn,
     });
   } finally {
     clearTimeout(watchdog);
     clearTimeout(hardStop);
     if (!drained) abort.abort();
   }
+}
+
+/**
+ * 模型活性回传：思考中/正在写/正在取数 + 已多少字 + 已多久。没有它，长调用与死机无从分辨。
+ *
+ * 两条信息要分开（§5.1）：`key` 是**单元标识**（哪一段：初排/深挖/终排），
+ * `text` 是可以随时刷新的显示文本（秒数每秒在变）。活动台账按 key 去重计数，
+ * 若把秒数并进 key，一次 15 分钟的思考会被数成几百个「单元」。
+ */
+const tickOf = (onEvent, scope, key) => (t) => onEvent?.({
+  type: 'tick', scope, key: key || scope, ...t,
+  text: tickText(scope, t),
+});
+
+/** tick → 人话。前端与 CLI 都直接显示它，两边不再各写一套映射。 */
+export function tickText(scope, t = {}) {
+  const s = Math.round((t.elapsedMs || 0) / 1000);
+  const where = `${scope || '模型'} · `;
+  if (t.phase === 'writing') return `${where}正在写结论（已 ${t.chars ?? 0} 字 / ${s}s）`;
+  if (t.phase === 'tool') return `${where}正在准备取数（${t.toolCalls ?? 1} 个调用，已 ${s}s）`;
+  return `${where}模型思考中（已 ${s}s）`;
 }
 
 /**
@@ -415,8 +504,12 @@ function emptyTextError(end) {
 /**
  * 带降级链的一次性生成。零产出即失败才换模型；已开始产出再失败的不换。
  * 返回 { text, model, stopReason, fallbacks[] }。
+ *
+ * 第 4 个参数 scope：只用于**报活性**（§5.1），不参与任何逻辑。
+ * 它必须能从调用方一路传到这里，否则「模型在哪一段、跑到第几分钟」在界面上
+ * 只剩一个全局的秒表——实测排障时正是缺这一条，长调用与死机分不出来。
  */
-export async function complete({ system, messages, maxTokens, temperature, onFallback, onTick }) {
+export async function complete({ system, messages, maxTokens, temperature, onFallback, onTick }, scope = '模型') {
   let lastErr;
   const fallbacks = [];
   for (let i = 0; i < MODELS.length; i++) {
@@ -424,7 +517,7 @@ export async function complete({ system, messages, maxTokens, temperature, onFal
     let text = '', end = {};
     try {
       for await (const t of stream({
-        system, messages, model, maxTokens, temperature, onTick,
+        system, messages, model, maxTokens, temperature, onTick: onTick || tickOf(null, scope, scope),
         onEnd: (e) => { end = e; },
       })) text += t;
       // 空正文**一律报错**，不分 stop_reason。
@@ -436,7 +529,8 @@ export async function complete({ system, messages, maxTokens, temperature, onFal
       lastErr = e;
       // 多模型链上「协议探测失败」是**模型特有的**，不该缓存到别的模型头上；
       // 单模型链则缓存无害（下次仍会重新探测，代价只是 1 个 1-token 请求）。
-      if (e.status === 401 || e.status === 403) throw e;   // 凭据问题是全链共因，换模型没意义
+      // 凭据问题与超预算都是全链共因，换模型没意义
+      if (e.status === 401 || e.status === 403 || e.status === 413) throw e;
       // 「已产出」只认**正文**。曾经用 anyDelta 判定，而思考分块也会把它置真，
       // 于是「思考完却不写正文」被误认为「已经开始产出」，降级链形同虚设。
       const produced = text.length > 0;
@@ -495,27 +589,29 @@ export async function completeWithTools({
   maxToolCalls = NARRATIVE.tools.maxToolCalls,
   loopTimeoutMs = NARRATIVE.tools.loopTimeoutMs,
   maxResultChars = NARRATIVE.tools.maxResultChars,
-  onFallback, onTick, onToolEvent,
+  onFallback, onTick, onToolEvent, scope = '模型',
 }) {
   const t0 = Date.now();
   const fallbacks = [];
   const toolLog = [];
   const convo = [...(messages || [])];
   const left = () => loopTimeoutMs - (Date.now() - t0);
+  const tick = onTick || tickOf(null, scope, scope);   // 与 complete() 同理：活性必须有默认出口
   let used = 0;   // 已执行的工具调用数（主闸）
+  let ctxFull = false;   // 上下文预算已满（v0.10.0）：与次数/轮数/时长闸同级
 
   // ── 首轮：用降级链挑出一个能干活的模型 ────────────────────────
   let model = null, first = null, rejected = 0, lastErr = null;
   for (let i = 0; i < MODELS.length; i++) {
     try {
-      first = await oneRound({ system, messages: convo, model: MODELS[i], maxTokens, temperature, tools, onTick });
+      first = await oneRound({ system, messages: convo, model: MODELS[i], maxTokens, temperature, tools, onTick: tick });
       // 有正文**或**有工具调用都算产出——后者是工具循环的正常首轮形态
       if (!first.text.trim() && !first.toolCalls.length) throw emptyTextError(first.end);
       model = MODELS[i];
       break;
     } catch (e) {
       lastErr = e;
-      if (e.status === 401 || e.status === 403) throw e;
+      if (e.status === 401 || e.status === 403 || e.status === 413) throw e;
       if (toolsRejected(e)) rejected++;
       if (i === MODELS.length - 1) break;
       fallbacks.push({ from: MODELS[i], to: MODELS[i + 1], reason: e.message });
@@ -527,7 +623,7 @@ export async function completeWithTools({
   // 不让整轮裁决因为渠道能力缺失而失败：没有工具的结论仍然是个结论。
   if (!model && rejected > 0) {
     onToolEvent?.({ type: 'tools-disabled', reason: lastErr?.message });
-    const plain = await complete({ system, messages: convo, maxTokens, temperature, onFallback, onTick });
+    const plain = await complete({ system, messages: convo, maxTokens, temperature, onFallback, onTick }, scope);
     // toolCalls 统一为**数字**（已执行的取数次数）。complete() 的返回里
     // 透传了 stream() 的 toolCalls 数组，这里必须盖掉，否则同一字段两种类型
     return { ...plain, rounds: 1, toolCalls: 0, toolLog: [], toolsDisabled: true, toolsDisabledReason: lastErr?.message };
@@ -547,6 +643,11 @@ export async function completeWithTools({
     for (const c of round.toolCalls) blocks.push({ type: 'tool_use', id: c.id, name: c.name, input: c.input });
     convo.push({ role: 'assistant', content: blocks });
 
+    // 上下文占用：上一轮的真实输入 token 优先（渠道回了 usage 时），否则整段估算；
+    // 再加上刚记进去的 assistant turn。之后每回填一条工具结果就累加一次
+    let ctx = (round.end?.inputTokens ?? estimateTokens(`${system || ''}\n${JSON.stringify(convo.slice(0, -1))}`))
+      + estimateTokens(JSON.stringify(blocks));
+
     // 执行工具。预算/超时耗尽时**如实告知模型**，不静默截断——
     // 静默截断会让模型以为「取不到数据」，而真相是「不让它取了」，两者结论不同。
     const results = [];
@@ -554,7 +655,8 @@ export async function completeWithTools({
       // 硬闸：越过即不再执行任何取数
       const hard = used >= maxToolCalls ? `取数次数已达硬上限（${maxToolCalls} 次）`
         : n >= maxRounds ? `取数轮次已达上限（${maxRounds} 轮）`
-          : left() <= 0 ? '取数时间预算已用尽' : null;
+          : left() <= 0 ? '取数时间预算已用尽'
+            : ctxFull ? `上下文预算已满（约 ${ctx} / ${NARRATIVE.context.inputTokens} token）` : null;
       // 软闸：仍然执行，但在结果里附告知，让模型自己决定要不要继续
       const soft = !hard && used >= softToolCalls
         ? `\n\n[预算提示] 软预算已用尽（已取数 ${used + 1} 次，软上限 ${softToolCalls}、硬上限 ${maxToolCalls}）。`
@@ -574,12 +676,13 @@ export async function completeWithTools({
           content = `工具执行失败：${e.message}`;
         }
       }
-      let truncated = false;
-      if (content.length > maxResultChars) {
-        content = `${content.slice(0, maxResultChars)}\n…（结果过长已截断，原 ${content.length} 字）`;
-        truncated = true;
-      }
+      // 按上下文剩余空间收口（取代此前固定的「单条 12000 字」）
+      const fit = fitToContext(content, { usedTokens: ctx, maxChars: maxResultChars });
+      content = fit.content;
+      const truncated = fit.truncated;
+      if (fit.full) ctxFull = true;
       if (soft) content += soft;
+      ctx += estimateTokens(content);
       toolLog.push({
         round: n, name: c.name, input: c.input, chars: content.length,
         truncated, exhausted: !!hard, softWarned: !!soft,
@@ -589,12 +692,12 @@ export async function completeWithTools({
     }
     convo.push({ role: 'user', content: results });
 
-    // 预算耗尽后最后一问：撤掉 tools，逼出正文结论
-    const done = n >= maxRounds || left() <= 0 || used >= maxToolCalls;
+    // 预算耗尽后最后一问：撤掉 tools，逼出正文结论（上下文满了同理）
+    const done = n >= maxRounds || left() <= 0 || used >= maxToolCalls || ctxFull;
     try {
       round = await oneRound({
         system, messages: convo, model, maxTokens, temperature,
-        tools: done ? undefined : tools, onTick,
+        tools: done ? undefined : tools, onTick: tick,
       });
     } catch (e) {
       // 已经取过数了，这里失败不换模型（副作用会重放、历史对新模型未必合法），

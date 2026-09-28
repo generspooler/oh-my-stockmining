@@ -3,7 +3,7 @@
 import * as em from './sources/em.js';
 import * as val from './valuation.js';
 import * as views from './views.js';
-import { normalizedEarnings, normalizedRoe, isCyclical, ttmRevenue } from './metrics/normalize.js';
+import { normalizedEarnings, normalizedRoe, ttmRevenue, fundamentalHistory, quarterlyHistory } from './metrics/normalize.js';
 import { qualityGateGeneral, qualityGateFinancial } from './metrics/scores.js';
 import { isFinancial, multipleRoute } from './classify.js';
 import { median, safeDiv } from './util.js';
@@ -142,10 +142,13 @@ export async function analyzeOne(stock) {
     : /证券/.test(stock.industry || '') ? '证券' : /保险/.test(stock.industry || '') ? '保险' : null;
 
   // ── 数据 ────────────────────────────────────────────────
-  const [series, indicators, statements] = await Promise.all([
+  const [series, indicators, statements, forecast] = await Promise.all([
     val.multipleSeries(stock),
     market === 'cn' ? em.mainIndicators(stock.code) : Promise.resolve([]),
     market === 'cn' ? em.statementsCN(stock.code) : em.statementsUS(stock.code, em.usSuffix(stock.mk)),
+    market === 'cn'
+      ? em.forecastCN(stock.code).catch((e) => ({ ok: false, reason: `一致预期取数失败：${e.message}` }))
+      : Promise.resolve({ ok: false, reason: '美股一致预期：当前数据源无此接口' }),
   ]);
   const latestSeries = series.rows?.[0] || {};
   const price = latestSeries.close ?? null;
@@ -156,10 +159,13 @@ export async function analyzeOne(stock) {
     ?? statements?.annual?.[0]?.sharesDiluted ?? statements?.annual?.[0]?.sharesBasic ?? null;
 
   // ── 归一化与路由 ────────────────────────────────────────
-  const cyc = isCyclical(market === 'cn' ? statements : statements, market);
+  // v0.10.0：route 只是**机械默认口径**（按「哪个倍数算得出来」选，不判股性），
+  // 供本文件的多视角 / 档位 / 置信度这几段机械输出使用。真正的股性判断与选锚在归因 pass：
+  // 全部锚并排给模型（anchors），它选哪个由 attribution.valuation 呈现。
   const norm = normalizedEarnings(statements, market, { shares, isFinancial: fin });
   const nroe = fin ? normalizedRoe(statements, market) : { ok: false };
-  const route = multipleRoute({ industry: stock.industry, market, cyclical: cyc.cyclical, normEps: norm.normEps });
+  const route = multipleRoute({ industry: stock.industry, market, normEps: norm.normEps });
+  const anchors = val.anchorsFor({ row: { ...stock, price }, series, norm, market });
 
   // 每股口径：PE 路由用归一化 EPS；PB 路由用每股净资产；PS 路由用每股营收
   const bps = latestInd.bps ?? safeDiv(statements?.annual?.[0]?.equity ?? null, shares);
@@ -169,22 +175,9 @@ export async function analyzeOne(stock) {
     : route.primary === 'ps' ? safeDiv(revTtm, shares)
     : null;
 
-  // ── 分位与三档 ──────────────────────────────────────────
-  const perShareOf = (primary) => primary === 'pe' ? norm.normEps
-    : primary === 'pb' ? bps
-    : primary === 'ps' ? safeDiv(revTtm, shares) : null;
-
+  // ── 分位与三档（机械默认口径）──────────────────────────
   const pcts = val.multiplePercentiles(series.rows, route.primary, series.freq);
   const band = val.bands({ route, perShare, pcts, price });
-
-  // 周期 / 高增长界限模糊时，机械层不裁决：把另一条口径也算出来，由模型在归因 pass 里选。
-  let altRoute = null, altBand = null, altPcts = null;
-  if (cyc.ambiguous) {
-    const altPrimary = route.primary === 'pb' ? 'pe' : 'pb';
-    altRoute = { primary: altPrimary, check: route.primary, reason: `备选口径：${altPrimary.toUpperCase()} 分位（若判定为成长而非周期）` };
-    altPcts = val.multiplePercentiles(series.rows, altPrimary, series.freq);
-    altBand = val.bands({ route: altRoute, perShare: perShareOf(altPrimary), pcts: altPcts, price });
-  }
 
   // ── 质量闸门 ────────────────────────────────────────────
   const goodwillRatio = safeDiv(statements?.[0]?.goodwill ?? null, statements?.[0]?.equity ?? null);
@@ -241,23 +234,33 @@ export async function analyzeOne(stock) {
 
   const requiredMos = val.requiredMos(fScore);
   const mos = val.actualMos(band.pv);
-  const altMos = altBand?.ok ? val.actualMos(altBand.pv) : null;
+  const annualRoe = annuals.slice(0, 5).map((r) => r.roe).filter((x) => x != null && isFinite(x));
 
   return {
     stock, price, market, isFinancial: fin, orgType: orgTypeGuess,
-    cyclical: cyc, route, normalization: norm, normalizedRoe: nroe,
+    route, normalization: norm, normalizedRoe: nroe,
     series: { source: series.source, points: series.rows?.length || 0, reversed: !!series.reversed },
     seriesRows: series.rows,   // 供背离分复用，避免再拉一次价格
     percentiles: pcts, band, tier, tierCapped,
-    routeAmbiguous: !!cyc.ambiguous, altRoute, altBand, altPercentiles: altPcts,
+    // 全部估值锚 + 一致预期 + 股性证据（v0.10.0）。形状与深度档案一致，
+    // 归因 pass 直接用 deep.renderValuation() 渲染，不另写一份
+    anchors, forecast,
+    fundamentals: fundamentalHistory(statements, market),
+    valuationView: {
+      market, anchors, forecast, fundamentals: fundamentalHistory(statements, market),
+      quarters: quarterlyHistory(statements, market),
+      seriesAsOf: latestSeries.date || null,
+      roe: latestInd.roe ?? null, roeMedian5: median(annualRoe),
+      netProfit: latestInd.parentNetProfit ?? null, shares,
+    },
     quality: gate, fScore,
     views: vw, cross, bandAgreement: bandAgree,
     confidence: conf, coverage: cov,
-    // 口径存疑时任一口径达标即放行，真正的取舍交给模型（不在机械层替它做商业判断）
+    // 机械默认口径下的安全边际。模型选的锚在 attribution.valuation 里，两者都呈现
     mos: {
-      required: requiredMos, actual: mos, alt: altMos,
-      pass: (mos != null && mos >= requiredMos) || (altMos != null && altMos >= requiredMos),
-      passedBy: mos != null && mos >= requiredMos ? route.primary : altMos != null && altMos >= requiredMos ? altRoute?.primary : null,
+      required: requiredMos, actual: mos,
+      pass: mos != null && mos >= requiredMos,
+      passedBy: mos != null && mos >= requiredMos ? route.primary : null,
     },
     // 注入模型的数字白名单（铁律 3）：模型输出的任何数字都必须来自这里
     numbers: buildNumbers({ stock, price, band, pcts, norm, latestInd, conf, mos, requiredMos, fScore, ttmNetProfit, revTtm }),

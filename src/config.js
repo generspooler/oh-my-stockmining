@@ -64,25 +64,39 @@ export const SCREENING = {
   // 单批行数过多时按「跌幅 + 估值」预排序截断，避免超出上下文。
   // 这是**容量限制**不是质量判断——被截断的标的会记录数量并如实告知模型。
   // 单批行数上限。实测 1765 只（77k token 输入）在 maxTokens=64000 下可一次跑通，
-  // 耗时 181s、入选质量良好，因此无需切分——保持「A股 6 批 / 美股 5 批 + 1 次裁决」。
+  // 耗时 181s、入选质量良好，因此无需切分——保持「A股 6 批 / 美股 5 批」。
   // 之前 1200 行失败是 token 预算（32000）被 reasoning 吃光所致，不是行数本身的问题。
   // 真正超限时才切片，切片会增加调用次数并如实播报。
   maxRowsPerBatch: envNum('MINE_MAX_ROWS_PER_BATCH', 2500),
 
-  // ── 阶段 4 · 总裁决 ─────────────────────────────────────────
+  // ── 阶段 4 · 总裁决（三段式，§3.2 阶段 4）────────────────────
+  // 榜单席位 = minN ~ topN（v0.9.0 用户决策 2026-09-26：至少 5、最多 10）。
+  // 达标的按排序占席，最多 topN；达标不足 minN 时由「最接近达标」的补足到 minN，
+  // 补位的逐只标注「未达标 · 机制补位」及差在哪——补位是机制要求，不是推荐。
+  // 此前是「宁缺毋滥、如实少选」，实测 9 只自选池只给出 3 只，用户要的是可比较的最小名单。
   topN: envNum('MINE_TOP_N', 10),
+  minN: envNum('MINE_MIN_N', 5),
+  // 段 4a 点名上限 = topN + 这个余量。深挖要解决的是「谁进 Top N」的边界问题，
+  // 给出比名额略多的余量即可。
+  //
+  // **这个数直接决定深挖预算**：预算 = NARRATIVE.tools.budgets.marketPerPick × 点名数。
+  // 默认 10 + 4 = 14 只 × 每只 3 次 = 软上限 42 次取数，而单次返回上限 12000 字符
+  // ——深挖那一段的对话最多能累积到几十万字符，且每轮都要重发。
+  // 嫌贵就调小这个余量或 marketPerPick（两者都可用环境变量覆盖）。
+  deepPickMargin: envNum('MINE_DEEP_PICK_MARGIN', 4),
 
   // ── 自选池挖掘（SYSTEM_DEFINITION §3.3）───────────────────────
   // v0.6 用户决策 2026-09-23：自选池与市场挖掘**彻底分开**，两条流水线、
   // 两个按钮、两张榜。自选票不再直通市场粗筛、不再占市场 Top 席位，
   // 分组配额（quotas/capByGroup）随之退役。
   //
-  // 这里的 topN 是**自选池自己那张榜**的名额，与市场榜的 SCREENING.topN 无关：
-  // 池内前 8 只给完整分析，其余逐只给落选理由（三句话 + 关键数据），一只都不省略。
-  // 取 8 而非 topN/2：池子通常 10~20 只，选 8 只既保留筛选意义，
-  // 又不至于把值得买的挤出详析区。
+  // 这里的 topN / minN 是**自选池自己那张榜**的席位，与市场榜的 SCREENING.topN 无关：
+  // 榜内给完整分析，其余逐只给落选理由（三句话 + 关键数据），一只都不省略。
+  // v0.9.0（用户决策 2026-09-26）：8 席上限、可为空 → 5~10 席，规则与市场榜一致。
+  // 池子小于 minN 时下限自动降为池子大小（没有票可补）。
   watch: {
-    topN: envNum('MINE_WATCH_TOP_N', 8),
+    topN: envNum('MINE_WATCH_TOP_N', 10),
+    minN: envNum('MINE_WATCH_MIN_N', 5),
     // 池子超过此数在网页提示（逐股补数，耗时随池子线性增加）。不硬拦。
     sizeHint: envNum('MINE_WATCH_SIZE_HINT', 10),
   },
@@ -124,9 +138,9 @@ export const SCREENING = {
     minWindowDays: 750,        // < 3 年 → 标记「序列不足」并强制降置信度
     percentiles: [25, 50, 75], // 保守 / 中性 / 乐观
     outlierPct: 99,            // 剔除 > 99 分位的极端点
-    // 周期股判定：满足任一即判为周期股，主倍数切换为 PB
-    cyclicalCV: 0.5,           // 近 7 年营业利润率变异系数
-    cyclicalRevSwing: 0.25,    // 或营收同比曾超 ±25%
+    // v0.10.0 删除周期股判定（cyclicalCV 0.5 / cyclicalRevSwing 0.25）。
+    // 实测 A股 55 只非金融候选被判周期 35 只（64%），迈瑞、金山办公都在内；
+    // 其中 25 只换口径后档位不同。股性是商业判断，交给模型（§2.3 步骤 3）。
   },
 
   // 档位阈值：P/V 比值（P=现价，V=中性值）。索引 0 最便宜
@@ -172,7 +186,7 @@ export const NARRATIVE = {
   // 风险不对称：裸名同样能调通（网关按模型名路由到某个渠道，实测 gpt-5.6-sol 可用），
   // 但渠道 ID 唯一确定一条渠道，模型名可能对应多个渠道、路由到哪个不由我们决定。
   // 因此默认写渠道 ID——自主可控优先于可读。
-  model: envStr('MINE_MODEL', 'GPT_bhlzrh'),
+  model: envStr('MINE_MODEL', 'claude-opus-5-5'),
   // 降级链：主模型失败（空正文 / HTTP 错误 / 未声明协议）时依次换。
   // 必须写 []（而不是注释掉整行）——llm.js 顶层就解引用这个字段，
   // 缺字段会让 import 期直接崩在 `.filter`，报错还完全看不出是配置问题。
@@ -207,6 +221,17 @@ export const NARRATIVE = {
   schemaRetries: 1,
   concurrency: envNum('MINE_LLM_CONCURRENCY', 3),
 
+  // ── 上下文预算（v0.10.0，用户决策 2026-09-26）───────────────
+  // 模型窗口 1M，但渠道侧的 system prompt / MCP / skills 要占一块，
+  // 用户定的可用量是「至少 256k～500k」。取下沿 256k 作默认，按需用环境变量调到 500k。
+  // 这是**单次调用的输入上限**（含工具循环累积的全部对话），不含输出（maxTokens 另计）。
+  // 它替代了此前「单条工具返回 12000 字」这种按条数防御的写法：真正要防的是总量。
+  context: {
+    inputTokens: envNum('MINE_CONTEXT_TOKENS', 256000),
+    // 工具循环里给最后一问（撤掉工具逼出结论）留的余量
+    reserveTokens: envNum('MINE_CONTEXT_RESERVE', 16000),
+  },
+
   // ── 工具循环（细筛取数能力）────────────────────────────────
   // 探针实测（.run/probe-tools.mjs）：本渠道 OpenAI 协议支持完整工具往返
   // （轮1 stop=tool_calls、轮2 回填 role:'tool' 后正常续写）；
@@ -225,13 +250,12 @@ export const NARRATIVE = {
     // 工具循环的**总**时长上限。NARRATIVE.callTimeoutMs 是 per-stream 的，
     // 多轮循环会拿到 N × 20 分钟，等于没有上限，必须另设一个总闸。
     loopTimeoutMs: envNum('MINE_TOOL_LOOP_TIMEOUT_MS', 30 * 60e3),
-    // 单次工具返回的字符上限，在 llm.js 里统一截断。
-    // 这是本方案最大的 context 膨胀风险的唯一收口处：实测 77k token 输入曾只剩
-    // 164 token 给正文、模型吐出 0 字（见 maxTokens 那段注释）。
-    // 取 12000：财报正文是本方案的主要价值来源，而实测 MD&A 普遍 1.8~4.4 万字符
-    // （AAPL 1.8 万 / NVDA 3.4 万 / UNH 3.6 万 / LULU 4.4 万），
-    // 6000 只能看到开头一小段；12000 能覆盖「概述 + 经营结果」这两块最有用的部分。
-    maxResultChars: envNum('MINE_TOOL_MAX_RESULT_CHARS', 12000),
+    // 单次工具返回的字符上限。v0.10.0：12000 → 60000。
+    // 实测 MD&A 普遍 1.8~4.4 万字符（AAPL 1.8 万 / NVDA 3.4 万 / UNH 3.6 万 / LULU 4.4 万），
+    // 12000 只够看「概述 + 经营结果」；60000 能拿到整章。总量不再靠这里防——
+    // 由 NARRATIVE.context 的输入预算在工具循环里按剩余空间收口（llm.js fitToContext）。
+    // 「77k token 输入只剩 164 token 给正文」那次教训是 maxTokens 被思考吃光，不是窗口不够。
+    maxResultChars: envNum('MINE_TOOL_MAX_RESULT_CHARS', 60000),
     // 按入口分别设预算。单股是用户主动点名深挖一只，可以大方给；
     // 市场深挖那一段要摊给好几只，因此按「点名只数」动态放大而不是固定值。
     budgets: {
@@ -240,6 +264,30 @@ export const NARRATIVE = {
       // 市场深挖：每只点名标的的取数配额，乘以点名数即为本段预算
       marketPerPick: envNum('MINE_TOOL_MARKET_PER_PICK', 3),
     },
+  },
+
+  // ── 联网研究员（v0.11.0，用户决策 2026-09-27）──────────────────
+  // 结构化接口回答不了「年报之后发生了什么、为什么跌」：美股自选 44 只里 19 只有效新闻为 0，
+  // 8-K 一条没有。所以由一个 Claude Code 无头会话（claude -p）替入围票上网查事件。
+  // 分工：**数字只认结构化接口，联网只补事件与原因**。
+  // 每轮只起**一个**会话覆盖全部入围票（用户：「每只起一个没有必要」），会话内允许开子代理并行。
+  // 批内初筛与粗筛不联网（与工具作用域一致）。
+  research: {
+    // MINE_RESEARCH=0 关闭（离线跑、或 claude 命令不可用时）
+    enabled: envStr('MINE_RESEARCH', '1') !== '0',
+    bin: envStr('MINE_CLAUDE_BIN', 'claude'),
+    // 用户指定 claude-opus-5-5。**必须显式传**：环境变量 ANTHROPIC_MODEL 可能指向别的模型
+    //（实测为 deepseek），不传 --model 研究员会悄悄跟着它走
+    model: envStr('MINE_RESEARCH_MODEL', 'claude-opus-5-5'),
+    // 用户定的上限 20 分钟。到点即终止，已经交出的逐只结论照用
+    timeoutMs: envNum('MINE_RESEARCH_TIMEOUT_MS', 20 * 60e3),
+    // 单只结论里事件条数上限（防一只票刷屏；按重要性取前 N 条）
+    maxEvents: envNum('MINE_RESEARCH_MAX_EVENTS', 8),
+    // 允许研究员激活 agent-reach skill（用户决策 2026-09-27）。MINE_RESEARCH_AGENT_REACH=0 关闭；
+    // 来源目录默认 ~/.claude/skills/agent-reach，可用 MINE_AGENT_REACH_DIR 指定。
+    // 它路由表里的命令只放行白名单里的只读写法（research-guard.js），不是整个 skill 的全部能力
+    agentReach: envStr('MINE_RESEARCH_AGENT_REACH', '1') !== '0',
+    agentReachDir: envStr('MINE_AGENT_REACH_DIR', ''),
   },
 };
 

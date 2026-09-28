@@ -8,7 +8,7 @@
 // 核心约束：**整篇不可能交给模型，必须分节抽取**。实测规模：
 //   茅台 2026 半年报 = 44 页 × 5000 字 ≈ 22 万字
 //   AAPL 2025 10-K   = 主文档 1.52MB HTML，去标签后 23.3 万字符
-// 而单次工具返回上限是 NARRATIVE.tools.maxResultChars（6000）。
+// 单次工具返回上限是 NARRATIVE.tools.maxResultChars（v0.10.0 起 60000，总量另由上下文预算收口）。
 //
 // 分节抽取是**启发式**的，两边都要对付同一个陷阱：目录里也有章节名。
 //   A股：第 1 页（目录）同时出现「管理层讨论与分析」与第三/四/五节，
@@ -252,7 +252,11 @@ async function usFilingText(url) {
 // 而 CI 的交叉引用是「Item 7 <完整标题> of this Form 10-K」——
 // 前缀匹配会让切片落在标题中间（"and Analysis of…"），连接词就贴不上了。
 // 故可选尾部一律写成贪婪可选组。
-const US_TITLES = {
+const MDNA_TITLE = /^\s*management\s*.{0,3}s?\s+discussion\s+and\s+analysis(\s+of\s+financial\s+condition(\s+and\s+results\s+of\s+operations)?)?/i;
+const MKT_RISK_TITLE = /^\s*quantitative\s+and\s+qualitative\s+disclosures(\s+about\s+market\s+risk)?/i;
+
+// 10-K：编号即章节，一号一名，所以 id 就是编号。
+const TITLES_10K = {
   1: /^\s*business\b/i,
   '1A': /^\s*risk\s+factors/i,
   '1B': /^\s*unresolved\s+staff\s+comments/i,
@@ -262,18 +266,49 @@ const US_TITLES = {
   4: /^\s*mine\s+safety\s+disclosures/i,
   5: /^\s*market\s+for\s+registrant\s*.{0,3}s?[^.]{0,120}/i,
   6: /^\s*(\[?\s*reserved\s*\]?|selected\s+financial\s+data)/i,
-  7: /^\s*management\s*.{0,3}s?\s+discussion\s+and\s+analysis(\s+of\s+financial\s+condition(\s+and\s+results\s+of\s+operations)?)?/i,
-  '7A': /^\s*quantitative\s+and\s+qualitative\s+disclosures(\s+about\s+market\s+risk)?/i,
+  7: MDNA_TITLE,
+  '7A': MKT_RISK_TITLE,
   8: /^\s*financial\s+statements\s+and\s+supplementary\s+data/i,
   9: /^\s*changes\s+in\s+and\s+disagreements\s+with\s+accountants[^.]{0,90}/i,
   '9A': /^\s*controls\s+and\s+procedures/i,
 };
 
-const US_ITEMS = {
-  business: { item: '1', label: 'Item 1 Business', next: ['1A'] },
-  risk: { item: '1A', label: 'Item 1A Risk Factors', next: ['1B', '1C', '2'] },
-  mdna: { item: '7', label: "Item 7 Management's Discussion and Analysis", next: ['7A', '8'] },
-  marketRisk: { item: '7A', label: 'Item 7A Quantitative and Qualitative Disclosures', next: ['8'] },
+// 10-Q（v0.11.0）：Part I 与 Part II 的编号**重复**——Item 1 既是财务报表也是法律诉讼，
+// Item 2 既是 MD&A 也是股票回购——只能靠章节名区分。所以键是「章节 id」，n 是正文里的编号。
+const TITLES_10Q = {
+  'I-1': { n: '1', re: /^\s*financial\s+statements/i },
+  'I-2': { n: '2', re: MDNA_TITLE },
+  'I-3': { n: '3', re: MKT_RISK_TITLE },
+  'I-4': { n: '4', re: /^\s*controls\s+and\s+procedures/i },
+  'II-1': { n: '1', re: /^\s*legal\s+proceedings/i },
+  'II-1A': { n: '1A', re: /^\s*risk\s+factors/i },
+  'II-2': { n: '2', re: /^\s*unregistered\s+sales/i },
+  'II-3': { n: '3', re: /^\s*defaults\s+upon\s+senior\s+securities/i },
+  'II-4': { n: '4', re: /^\s*mine\s+safety\s+disclosures/i },
+  'II-5': { n: '5', re: /^\s*other\s+information/i },
+  'II-6': { n: '6', re: /^\s*exhibits/i },
+};
+
+const US_FORMS = {
+  '10-K': {
+    titles: Object.fromEntries(Object.entries(TITLES_10K).map(([k, re]) => [k, { n: k, re }])),
+    items: {
+      business: { item: '1', label: 'Item 1 Business', next: ['1A'] },
+      risk: { item: '1A', label: 'Item 1A Risk Factors', next: ['1B', '1C', '2'] },
+      mdna: { item: '7', label: "Item 7 Management's Discussion and Analysis", next: ['7A', '8'] },
+      marketRisk: { item: '7A', label: 'Item 7A Quantitative and Qualitative Disclosures', next: ['8'] },
+    },
+  },
+  '10-Q': {
+    titles: TITLES_10Q,
+    items: {
+      mdna: { item: 'I-2', label: "Part I Item 2 Management's Discussion and Analysis", next: ['I-3', 'I-4', 'II-1', 'II-1A'] },
+      // 10-Q 的风险章节常常只有一句「相对年报无重大变化」（NFLX 213 字符）——这就是内容本身，
+      // 不能按 10-K 的长度先验判成残留；门槛放在 3000 还会让选段跳到更早的交叉引用上（PFE 实测）
+      risk: { item: 'II-1A', label: 'Part II Item 1A Risk Factors', next: ['II-2', 'II-3', 'II-4', 'II-5', 'II-6'], minLen: 80, minPlausible: 80 },
+      marketRisk: { item: 'I-3', label: 'Part I Item 3 Quantitative and Qualitative Disclosures', next: ['I-4', 'II-1'] },
+    },
+  },
 };
 
 // 交叉引用的连接词。**必须在章节名之后**判断，不能只看编号紧后的那几十字符：
@@ -285,15 +320,21 @@ const US_ITEMS = {
 // 只看紧随其后的连接词，否则会把真标题误杀。
 // `of our` / `within this` 是 KLAC 与 ORCL 实测用的说法，漏了它们就会把
 // 「Item 7 <完整标题> in this Annual Report on Form 10-K」当成真标题。
-const XREF_AFTER_TITLE = /^[\s,.:；;)]*(of\s+(th(is|e)|our)\b|in\s+th(is|e)\b|within\s+th(is|e)\b|included\s+(elsewhere|in)\b|as\s+(set\s+forth|described|discussed)\b|in\s+Part\s+[IV]+\b|see\s+\b|refer\s+to\b|under\s+the\s+heading\b|above\b|below\b)/i;
+// `section in/of` 是 PFE 10-Q 的说法：「Item 1A. Risk Factors section in our 2025 Form 10-K」。
+const XREF_AFTER_TITLE = /^[\s,.:；;)]*(of\s+(th(is|e)|our)\b|in\s+th(is|e)\b|within\s+th(is|e)\b|included\s+(elsewhere|in)\b|as\s+(set\s+forth|described|discussed)\b|in\s+Part\s+[IV]+\b|see\s+\b|refer\s+to\b|under\s+the\s+heading\b|above\b|below\b|section\s+(of|in)\b)/i;
+// 目录条目的签名（v0.11.0）：章节名后面紧跟**页码**（`…Operations 40 Item 7A`），
+// 正文标题后面紧跟的是正文（`…Operations The following discussion`）。
+const PAGE_AFTER_TITLE = /^[\s.:]*(page\s+)?\d{1,3}\b/i;
 // 未找到结束标记时的封顶。切到文末会产出几十万字符（ORCL 实测 36 万），
 // 既浪费缓存又让 chars 这个数字失去意义。
 const UNBOUNDED_CAP = 60000;
-// 合理性上限。真实章节再长也到不了这个量级：实测正常区间是
-// MD&A 1.8~4.4 万（AAPL/UNH/NVDA/LULU）、Risk Factors 6.7 万（AAPL/UNH）。
-// 抽出 25 万字符必然是起点选错、一路吃到了财务报表。
-// 这种情况返回「无法定位」而不是那一大坨——返回错段落比返回空更糟。
+// 长度复核线。实测正常区间是 MD&A 1.8~4.4 万（AAPL/UNH/NVDA/LULU）、
+// Risk Factors 6.7 万（AAPL/UNH）。超过这条线**不再直接判失败**（v0.11.0）：
+// 此前一刀切误杀了 8 只写得长的风险章节（APP 15.7 万、PLTR 29.8 万……），
+// 改为复核「中间有没有夹着别的章节的真标题」——夹着才是起点选错、一路吃过了头。
 const SANE_MAX = 150000;
+// 绝对上限：再长就不可能是单个章节了
+const HARD_MAX = 400000;
 const itemRe = (n) => new RegExp(`Item\\s+${String(n).replace('.', '\\.')}[\\.\\s:—-]`, 'gi');
 
 /**
@@ -309,28 +350,47 @@ const itemRe = (n) => new RegExp(`Item\\s+${String(n).replace('.', '\\.')}[\\.\\
  *
  * 三条都过之后，AAPL 的 Item 7 候选只剩 117716 这一个真起点，
  * 结束标记落在 Item 7A 的真标题 135697，得到约 1.8 万字符的 MD&A。
+ *
+ * 判据 3 会误伤（v0.11.0 补救）：AMZN / GOOGL / ALAB 的 Item 5「None.」、Item 6「[Reserved]」
+ * 极短，Item 4~7 的**正文**真标题挤进 1500 字符，被整段判成目录，于是一个候选都不剩。
+ * 这时改用页码判据兜底——**只在一个候选都没有时启用**，已经抽得对的文档行为不变。
+ *
+ * form：'10-K'（默认）或 '10-Q'。
  */
-export function extractItemUS(text, kind = 'mdna') {
-  const spec = US_ITEMS[kind];
-  if (!spec) return { ok: false, reason: `未知章节 ${kind}` };
+export function extractItemUS(text, kind = 'mdna', { form = '10-K' } = {}) {
+  const F = US_FORMS[form] || US_FORMS['10-K'];
+  const spec = F.items[kind];
+  if (!spec) return { ok: false, reason: `${form} 没有「${kind}」章节` };
   const src = String(text || '');
-  const all = Object.keys(US_TITLES);
+  const specNum = F.titles[spec.item].n;
 
+  // 同一编号可能对应多个章节（10-Q），逐个试章节名，命中哪个就是哪个
+  const byNum = new Map();
+  for (const [id, t] of Object.entries(F.titles)) {
+    if (!byNum.has(t.n)) byNum.set(t.n, []);
+    byNum.get(t.n).push(id);
+  }
   const marks = [];
-  for (const n of all) {
-    for (const m of src.matchAll(itemRe(n))) {
+  for (const [num, ids] of byNum) {
+    for (const m of src.matchAll(itemRe(num))) {
       const after = src.slice(m.index + m[0].length, m.index + m[0].length + 400);
-      const tm = US_TITLES[n].exec(after);
+      let id = null, tm = null;
+      for (const c of ids) {
+        const r = F.titles[c].re.exec(after);
+        if (r) { id = c; tm = r; break; }
+      }
+      const tail = tm ? after.slice(tm[0].length) : '';
       marks.push({
-        n, at: m.index,
+        num, n: id, at: m.index,
         titled: !!tm,
         // 章节名之后紧跟连接词 → 这是交叉引用，不是标题
-        xref: tm ? XREF_AFTER_TITLE.test(after.slice(tm[0].length)) : false,
+        xref: tm ? XREF_AFTER_TITLE.test(tail) : false,
+        paged: tm ? PAGE_AFTER_TITLE.test(tail) : false,
       });
     }
   }
   marks.sort((a, b) => a.at - b.at);
-  if (!marks.length) return { ok: false, reason: '全文未见任何 Item 标记（可能不是标准 10-K/10-Q 排版）' };
+  if (!marks.length) return { ok: false, reason: `全文未见任何 Item 标记（可能不是标准 ${form} 排版）` };
 
   // 目录簇：以每个标记为起点向后 TOC_WIN 字符，含 ≥4 个不同编号即判为目录段。
   //
@@ -340,24 +400,32 @@ export function extractItemUS(text, kind = 'mdna') {
   // Risk 的结束标记 Item 1B/1C（106266/106307）也被排除、抽到文末 18 万字符。
   // 真目录密度高一个量级——AAPL 目录 6 个条目只占 341 字符（19347→19688）。
   // 1500 把两者分得很开：目录 341 ✓ 命中，正文簇 2946 ✗ 不命中。
+  // 计数按**正文编号**而不是章节 id：10-Q 的同一处「Item 2」不能算两个编号。
   const TOC_WIN = 1500;
   const tocRanges = [];
   for (let i = 0; i < marks.length; i++) {
     const win = marks.filter((x) => x.at >= marks[i].at && x.at < marks[i].at + TOC_WIN);
-    if (new Set(win.map((x) => x.n)).size >= 4) tocRanges.push([marks[i].at, win[win.length - 1].at + 200]);
+    if (new Set(win.map((x) => x.num)).size >= 4) tocRanges.push([marks[i].at, win[win.length - 1].at + 200]);
   }
   const inToc = (at) => tocRanges.some(([a, b]) => at >= a && at <= b);
   const isHeading = (x) => x.titled && !x.xref && !inToc(x.at);
+  // 宽松判据：目录簇里、但章节名后面是正文不是页码的，也认作真标题
+  const isHeadingLoose = (x) => x.titled && !x.xref && (!inToc(x.at) || !x.paged);
 
-  const cands = marks.filter((x) => String(x.n).toUpperCase() === spec.item.toUpperCase() && isHeading(x));
+  let rescued = false;
+  let cands = marks.filter((x) => x.n === spec.item && isHeading(x));
   if (!cands.length) {
-    const seen = marks.filter((x) => String(x.n).toUpperCase() === spec.item.toUpperCase());
+    const alt = marks.filter((x) => x.n === spec.item && isHeadingLoose(x));
+    if (alt.length) { cands = alt; rescued = true; }
+  }
+  if (!cands.length) {
+    const seen = marks.filter((x) => x.num === specNum);
     return {
       ok: false,
       reason: `未定位到 ${spec.label} 的正文标题（该编号出现 ${seen.length} 次：`
         + `${seen.filter((x) => x.xref).length} 次是交叉引用、`
         + `${seen.filter((x) => inToc(x.at)).length} 次在目录、`
-        + `${seen.filter((x) => !x.titled).length} 次后面没有章节名）`,
+        + `${seen.filter((x) => !x.titled || x.n !== spec.item).length} 次后面没有章节名）`,
       tocRanges: tocRanges.length, totalMarks: marks.length,
     };
   }
@@ -365,11 +433,12 @@ export function extractItemUS(text, kind = 'mdna') {
   // 正文标题正常只剩一个。万一多个（少见的重复排版）：
   // **先看有没有结束标记**，有结束标记的才是真章节；都没有时再比长度。
   // 不能只按「跨度最长」——无界候选切到封顶值会稳赢真候选。
-  let best = null;
+  // 结束标记用宽松判据：下一章的真标题同样可能被目录簇误伤（短章节扎堆），
+  // 漏掉它就会一路吃到更后面的章节。
   const all2 = [];
   for (const c of cands) {
     const ends = marks
-      .filter((x) => x.at > c.at + 50 && spec.next.some((nn) => nn.toUpperCase() === String(x.n).toUpperCase()) && isHeading(x))
+      .filter((x) => x.at > c.at + 50 && spec.next.includes(x.n) && isHeadingLoose(x))
       .map((x) => x.at);
     const bounded = ends.length > 0;
     const end = bounded ? Math.min(...ends) : Math.min(src.length, c.at + UNBOUNDED_CAP);
@@ -381,27 +450,39 @@ export function extractItemUS(text, kind = 'mdna') {
   //      BRK.B 会挑到一个 1414 字符的片段，MD&A 不可能这么短；
   //   3. 剩下的取**靠后**那个——正文总在目录与前文交叉引用之后，
   //      「靠后」比「最长」是更好的先验（最长会偏向一路吃到财务报表的错起点）。
-  const MIN_PLAUSIBLE = 3000;
+  const MIN_PLAUSIBLE = spec.minPlausible ?? 3000;
   const bounded = all2.filter((x) => x.bounded);
   const plausible = bounded.filter((x) => x.len >= MIN_PLAUSIBLE);
   const pickLast = (xs) => xs.reduce((m, x) => (!m || x.start > m.start ? x : m), null);
-  best = pickLast(plausible)
+  const best = pickLast(plausible)
     || bounded.reduce((m, x) => (!m || x.len > m.len ? x : m), null)
     || pickLast(all2);
-  if (best.len < 400) {
+  if (best.len < (spec.minLen ?? 400)) {
     return { ok: false, reason: `定位到 ${spec.label} 但正文仅 ${best.len} 字符，判为残留而非正文` };
   }
+  let long = false;
   if (best.len > SANE_MAX) {
-    return {
-      ok: false,
-      reason: `定位到 ${spec.label} 但抽出 ${best.len} 字符，远超该章节的合理量级`
-        + `（正常 2~7 万），判为起点选错、一路吃到了后续章节，不返回内容`,
-    };
+    // 复核：中间夹着别的章节的真标题 = 起点选错或结束标记漏了，一路吃过了头
+    const inter = marks.filter((x) => x.at > best.start + 50 && x.at < best.end
+      && x.n && x.n !== spec.item && isHeadingLoose(x));
+    if (inter.length || best.len > HARD_MAX) {
+      return {
+        ok: false,
+        reason: `定位到 ${spec.label} 但抽出 ${best.len} 字符`
+          + (inter.length
+            ? `，中间夹着 ${[...new Set(inter.map((x) => `Item ${F.titles[x.n].n}`))].slice(0, 4).join('、')} 的标题，`
+              + '判为起点选错、一路吃到了后续章节，不返回内容'
+            : `，超过单个章节的绝对上限 ${HARD_MAX}，不返回内容`),
+      };
+    }
+    long = true;
   }
   return {
     ok: true, kind, label: spec.label, chars: best.len,
     // 找不到结束标记时如实标注：返回的内容可能混入后续章节，且已在 UNBOUNDED_CAP 处截断
     endUnbounded: best.bounded ? undefined : true,
+    rescued: rescued || undefined,
+    long: long || undefined,
     text: src.slice(best.start, best.end).trim(),
   };
 }
@@ -412,6 +493,6 @@ export async function filingSectionUS(ticker, { kind = 'mdna', form = '10-K' } =
   if (!idx.ok) return idx;
   const doc = await usFilingText(idx.url).catch((e) => ({ ok: false, reason: e.message }));
   if (!doc.ok) return { ok: false, reason: doc.reason, doc: idx.form, date: idx.filingDate };
-  const sec = extractItemUS(doc.text, kind);
+  const sec = extractItemUS(doc.text, kind, { form: idx.form });
   return { ...sec, doc: `${idx.form} (${idx.filingDate})`, date: idx.filingDate, url: idx.url };
 }

@@ -137,7 +137,9 @@ export async function kline(secid, { klt = 101, fqt = 1, beg = '20180101', end =
 
 /** A股逐日估值序列（PE_TTM / PB_MRQ / PS_TTM / PCF）。茅台约 2100 条。 */
 export async function valuationSeriesCN(code) {
-  return cached(`valseries:${code}`, CACHE_TTL.valuation, async () => {
+  // v2：多取静态 PE / 静态 PCF / PEG（同一张表本来就返回，此前没映射）。
+  // 缓存键必须跟着映射走，否则旧缓存里没有新字段、要等 TTL 过期才出现。
+  return cached(`valseries:v2:${code}`, CACHE_TTL.valuation, async () => {
     const rows = await dcAll({
       reportName: 'RPT_VALUEANALYSIS_DET', columns: 'ALL',
       sortTypes: -1, sortColumns: 'TRADE_DATE', filter: `(SECURITY_CODE="${code}")`,
@@ -145,10 +147,57 @@ export async function valuationSeriesCN(code) {
     return rows.map((r) => ({
       date: d10(r.TRADE_DATE),
       close: n(r.CLOSE_PRICE),
-      pe: n(r.PE_TTM), pb: n(r.PB_MRQ), ps: n(r.PS_TTM), pcf: n(r.PCF_OCF_TTM),
+      pe: n(r.PE_TTM), peLar: n(r.PE_LAR), pb: n(r.PB_MRQ), ps: n(r.PS_TTM),
+      pcf: n(r.PCF_OCF_TTM), pcfLar: n(r.PCF_OCF_LAR), peg: n(r.PEG_CAR),
       marketCap: n(r.TOTAL_MARKET_CAP), shares: n(r.TOTAL_SHARES),
       board: r.BOARD_NAME || null,
     })).filter((x) => x.date);
+  });
+}
+
+/**
+ * A股一致预期（v0.10.0）。两张表：
+ *   RPT_HSF10_RES_ORGPREDICT —— 逐机构预测，另有一行 ORG_NAME_ABBR=「近六月平均」，
+ *     直接给出各年 EPS 与对应 PE（即 forward PE，接口算好的，不自己重算）；
+ *   RPT_WEB_RESPREDICT —— 评级家数汇总（买入/增持/中性/减持/卖出）。
+ * 无覆盖的标的返回 { ok:false }，不猜。逐机构行只用来给出分歧区间（最低/最高 EPS）。
+ */
+export async function forecastCN(code) {
+  return cached(`forecast:${code}`, CACHE_TTL.misc, async () => {
+    const [orgs, sum] = await Promise.all([
+      dcAll({
+        reportName: 'RPT_HSF10_RES_ORGPREDICT', columns: 'ALL',
+        sortTypes: -1, sortColumns: 'PUBLISH_DATE', filter: `(SECURITY_CODE="${code}")`,
+      }, { maxPages: 2, pageSize: 100 }),
+      dcAll({
+        reportName: 'RPT_WEB_RESPREDICT', columns: 'ALL', filter: `(SECURITY_CODE="${code}")`,
+      }, { maxPages: 1, pageSize: 5 }),
+    ]);
+    const avg = orgs.find((r) => r.ORG_NAME_ABBR === '近六月平均');
+    if (!avg) return { ok: false, reason: '无机构一致预期（近六月无覆盖）' };
+    const years = [1, 2, 3, 4].map((i) => ({
+      year: n(avg[`YEAR${i}`]), mark: avg[`YEAR_MARK${i}`] || null,   // A=实际 E=预测
+      eps: n(avg[`EPS${i}`]), pe: n(avg[`PE${i}`]),
+    })).filter((y) => y.year != null && y.eps != null);
+    // 分歧：近 6 个月逐机构对第一个预测年的 EPS
+    const firstE = years.find((y) => y.mark === 'E');
+    const since = Date.now() - 183 * 864e5;
+    const peers = orgs.filter((r) => r.ORG_NAME_ABBR !== '近六月平均'
+      && Date.parse(String(r.PUBLISH_DATE).slice(0, 10)) >= since);
+    const epsOf = (r) => {
+      for (const i of [1, 2, 3, 4]) if (n(r[`YEAR${i}`]) === firstE?.year) return n(r[`EPS${i}`]);
+      return null;
+    };
+    const es = firstE ? peers.map(epsOf).filter((x) => x != null) : [];
+    const s0 = sum[0] || {};
+    return {
+      ok: true, asOf: d10(avg.PUBLISH_DATE), years,
+      spread: es.length ? { year: firstE.year, min: Math.min(...es), max: Math.max(...es), n: es.length } : null,
+      ratings: {
+        orgs: n(s0.RATING_ORG_NUM), buy: n(s0.RATING_BUY_NUM), add: n(s0.RATING_ADD_NUM),
+        neutral: n(s0.RATING_NEUTRAL_NUM), reduce: n(s0.RATING_REDUCE_NUM), sell: n(s0.RATING_SALE_NUM),
+      },
+    };
   });
 }
 

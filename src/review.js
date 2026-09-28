@@ -13,8 +13,12 @@
 // （≈1.6 万 token 正文），glm-5.3-flash 思考 15 分钟后 stop_reason=end_turn、
 // 正文 0 字——不是超预算，是单次输出量过大直接写不出来。改成
 // 「批内先筛 → 终裁只处理入围的」后，每次调用的输出量都与市场裁决相当。
-import { complete, completeWithTools, extractJson, validateNumbers, whitelistOf, dumpRaw } from './llm.js';
-import { capTop } from './verdict.js';
+import { complete, completeWithTools, extractJson, validateNumbers, whitelistOf, dumpRaw, tickText } from './llm.js';
+import {
+  fitBoard, boardRule, BOARD_FIELDS, ANCHOR_RULE, ANCHOR_FIELDS, WEB_RULE, withValuation, normalizeExternal,
+} from './verdict.js';
+import { runResearch, renderResearch, compactResearch } from './research.js';
+import { resolveAnchor } from './valuation.js';
 import { renderProfile } from './deep.js';
 import { buildTools, withTranscript } from './tools.js';
 import { pool as runPool } from './util.js';
@@ -25,6 +29,7 @@ export const STANCES = ['估值已修复', '等待催化', '基本面待验证',
 
 const REJECT_SCHEMA = `{
       "code": "代码",
+      ${ANCHOR_FIELDS}
       "stance": "估值已修复/等待催化/基本面待验证/疑似价值陷阱/数据不足",
       "why": "三句话：现在什么状态、为什么现在不该买、什么条件下重新考虑",
       "keyData": "支撑上述判断的关键数据，顿号分隔，如「P/V 1.02、安全边际 -2%、ROE 当期 9% vs 5年中位 18%、52周回撤 -8%」",
@@ -39,14 +44,11 @@ const COMMON = `判断标准与全市场挖掘完全一致——不因为是用�
 选择标准，按重要性排序：
 1. **这个便宜是错杀还是陷阱** —— 最重要。结构性衰退与商业模式证伪一律不选，
    无论多便宜
-2. **安全边际** —— 现价相对中性估值的折价幅度
+2. **安全边际** —— 按你选定的估值锚，现价相对其 5 年中位估值的折价幅度
 3. **生意质量** —— 长期资本回报水平、竞争地位、现金流质量
 4. **价值实现路径** —— 有没有可见的催化剂。便宜且好可以便宜十年
 
-关于估值区间的重要提醒：
-三档区间由「归一化盈利 × 历史倍数分位」算出。**归一化盈利本身假设了利润率回归历史中位数。**
-如果你判断某家公司的利润率是永久性下移（结构性衰退），那么这个估值区间整体失真，
-请在结论中明确指出，不要采信。
+${ANCHOR_RULE}
 
 关于新闻：检索基于公司名全文匹配，已滤除 ETF 播报与同名机构，但仍可能有无关条目。
 「未检索到」不代表没有事件发生，只说明这个渠道没抓到。
@@ -66,6 +68,8 @@ const COMMON = `判断标准与全市场挖掘完全一致——不因为是用�
 3. **不要**把记忆里的数字直接写进 thesis / keyData 等定量字段冒充实测值。
    定量结论只能用第 1 层的数字；第 2 层负责提出质疑与提供背景，不负责替换数据。
 
+${WEB_RULE}
+
 **发现给定数据有问题时请明说，不要将就着用。**`;
 
 const SYS = `你是深耕全球资本市场多年的资深价值投资分析师，遵循价值投资原则。
@@ -75,14 +79,16 @@ const SYS = `你是深耕全球资本市场多年的资深价值投资分析师�
 
 任务：对下列每一只给出「当下该不该买」的判断。
 
-1. 选出现在**最值得买入的至多 {{TOP_N}} 只**并排序，逐只给完整分析。
-   宁缺毋滥——合格的不足 {{TOP_N}} 只就如实少给，一只都不合格就给空数组，
-   绝不为了凑满而把估值已修复或基本面已证伪的标的放进来。
+1. 给出 **{{MIN_N}}~{{TOP_N}} 只**的榜单并排序，逐只给完整分析。
+
+{{BOARD_RULE}}
+
 2. **没进榜的每一只都必须出现在 rejected 里，一只都不能漏。**
    用户要知道自己池子里每只票此刻的状态，「没提到」对他等于信息丢失。
    每条 rejected 的 why 恰好写三句连贯的话，依次讲清：现在处于什么状态、
    为什么现在不该买、什么条件出现才值得重新考虑。**不要写①②③之类的序号**，
    直接写成三句话。keyData 另列支撑该判断的关键数据。
+   rejected 按**离买入标准由近到远**排序（最接近达标的排最前）。
 
 ${COMMON}
 
@@ -94,12 +100,15 @@ ${COMMON}
   "top": [
     {
       "code": "代码", "rank": 1,
+      ${BOARD_FIELDS}
+      ${ANCHOR_FIELDS}
+      "stance": "仅 meetsBar 为 false 时填写：估值已修复/等待催化/基本面待验证/疑似价值陷阱/数据不足",
       "attribution": "周期性底部/一次性事件冲击/流动性情绪杀/治理折价",
       "thesis": "投资逻辑，三到四句",
       "killCriteria": ["若X发生则结论作废", "..."],
       "risks": ["关键风险 2-3 条"],
       "catalyst": "价值实现路径；无则写'无可见催化剂，需要耐心'",
-      "valuationCaveat": "若认为估值区间因归一化假设而失真，在此说明；否则留空"
+      "valuationCaveat": "对所选锚仍有的保留（例如分位窗口偏短、口径适配有限），没有就留空"
     }
   ],
   "rejected": [${REJECT_SCHEMA}],
@@ -137,6 +146,8 @@ const BATCH_SYS = `你是深耕全球资本市场多年的资深价值投资分�
    用户要知道自己池子里每只票此刻的状态，「没提到」对他等于信息丢失。
    why 恰好三句连贯的话，依次讲清：现在处于什么状态、为什么现在不该买、
    什么条件出现才值得重新考虑。**不要写①②③之类的序号**。keyData 另列关键数据。
+   rejected 按**离买入标准由近到远**排序（最接近达标的排最前）：终榜至少要有
+   {{MIN_N}} 只，各批入围不够时，系统按这个次序把人补进终裁。
 
 ${COMMON}
 
@@ -175,6 +186,8 @@ function normalizeRejected(list, known, exclude = new Set(), seen = new Set()) {
     seen.add(k);
     out.push({
       code: known.get(k).code,
+      stockType: x.stockType || null, anchor: x.anchor ?? null, anchorWhy: x.anchorWhy || null,
+      valuation: resolveAnchor(x.anchor, known.get(k).anchors),
       stance: x.stance || '未归类',
       stanceUnmatched: x.stance && !STANCES.includes(x.stance) ? true : undefined,
       why: x.why || '',
@@ -211,55 +224,127 @@ export function completeCoverage(top, rejected, profiles) {
   return [...kept, ...missing];
 }
 
+const firstSentence = (s) => String(s || '').split(/(?<=[。！？])/)[0] || '';
+
 /**
- * 裁决结果归一化（纯函数，可测）。三件事：
- *   1. top 截到 topN 并重新编号（席位由代码裁定，不采信模型自报的 rank）；
- *   2. rejected 去掉幻觉代码、去重、剔除已进榜的；
- *   3. 兜底补漏（`completeCoverage`）。
+ * 被席位裁定截掉的条目 → 落选条目。它们模型**给过结论**，
+ * 不能落进兜底变成「模型未给结论」（那条文案说的是「多半是输出被截断」，是错的）。
  */
-export function normalizeReview(json, profiles, { topN = SCREENING.watch.topN } = {}) {
+function droppedToRejected(x, topN, anchors) {
+  const val = {
+    stockType: x.stockType || null, anchor: x.anchor ?? null, anchorWhy: x.anchorWhy || null,
+    valuation: resolveAnchor(x.anchor, anchors),
+  };
+  if (x.droppedWhy === 'overMax') {
+    return {
+      ...val, code: x.code, stance: '达标但超出席位',
+      why: `模型判为达标，但达标标的超过 ${topN} 席上限，按模型排序被截去。${firstSentence(x.thesis)}`,
+      keyData: null, suggestRemove: false,
+    };
+  }
+  return {
+    ...val, code: x.code, stance: x.stance || '未归类',
+    why: x.belowBarReason || x.thesis || '模型判为未达标；达标标的已满足榜单下限，无需补位。',
+    keyData: x.keyData || null, suggestRemove: !!x.suggestRemove,
+  };
+}
+
+/**
+ * 裁决结果归一化（纯函数，可测）。四件事：
+ *   1. 席位裁定（`fitBoard`）：min~max 席，达标在前、补位在后，重新编号
+ *      （席位由代码裁定，不采信模型自报的 rank）；
+ *   2. 模型给的不足下限时，按落选区次序（提示词要求「离达标由近到远」）由代码补位；
+ *   3. rejected 去掉幻觉代码、去重、剔除已进榜的；被截掉的带原因放回落选区；
+ *   4. 兜底补漏（`completeCoverage`）。
+ */
+export function normalizeReview(json, profiles, {
+  topN = SCREENING.watch.topN, minN = SCREENING.watch.minN,
+} = {}) {
   const known = new Map(profiles.map((p) => [key(p.code), p]));
-  const top = capTop((json?.top || []).filter((x) => known.has(key(x?.code))), topN);
+  const raw = (json?.top || []).filter((x) => known.has(key(x?.code)));
+  const rej = normalizeRejected(json?.rejected, known, new Set(raw.map((x) => key(x.code))));
+  const fill = rej.map((x) => ({
+    code: x.code, stance: x.stance, belowBarReason: x.why,
+    keyData: x.keyData, suggestRemove: x.suggestRemove,
+    stockType: x.stockType, anchor: x.anchor, anchorWhy: x.anchorWhy,
+  }));
+  // 模型只选锚，数字由代码按所选锚从档案里回填（resolveAnchor）
+  const { top, dropped } = withValuation(fitBoard(raw, { min: Math.min(minN, profiles.length), max: topN, fill }), known);
   const inTop = new Set(top.map((x) => key(x.code)));
-  const rejected = completeCoverage(top, normalizeRejected(json?.rejected, known, inTop), profiles);
+  const rejected = completeCoverage(top, [
+    ...rej.filter((x) => !inTop.has(key(x.code))),
+    ...dropped.map((x) => droppedToRejected({ ...x, code: known.get(key(x.code)).code }, topN, known.get(key(x.code)).anchors)),
+  ], profiles);
   return { top, rejected, externalNotes: normalizeExternal(json?.externalNotes, known) };
 }
 
 /**
- * 外部知识条目规整（分层数字规则的 L3）。
- * 允许 code 为空——「整个行业的库存周期还没见底」这类判断不属于某一只票。
- * 带 code 的则必须在池内，否则是幻觉代码。
+ * 分批路径的下限补足（纯函数，可测）：各批入围合计不足 need 只时，
+ * 从各批落选区**轮流**取人补进终裁——每批取它排在最前（最接近达标）的，
+ * 避免补位全落在同一批、同一个行业。疑似陷阱与建议移出的排到最后才用。
+ * 返回要补进终裁的代码（原始写法），不含已入围的。
  */
-export function normalizeExternal(list, known) {
+export function promoteForFloor(batchRejected, picked, need) {
+  if (need <= 0) return [];
+  const trap = (x) => x.suggestRemove || /陷阱|证伪|衰退/.test(x.stance || '');
+  const queues = (batchRejected || []).map((list) => (list || []).filter((x) => x?.code && !picked.has(key(x.code))));
   const out = [];
-  for (const x of list || []) {
-    const claim = String(x?.claim || '').trim();
-    if (!claim) continue;
-    const k = key(x?.code);
-    if (k && !known.has(k)) continue;
-    out.push({ code: k ? known.get(k).code : null, claim, why: String(x?.why || '').trim() || null });
+  const seen = new Set();
+  for (const pass of [(x) => !trap(x), trap]) {
+    const qs = queues.map((q) => q.filter(pass));
+    for (let i = 0; out.length < need && qs.some((q) => i < q.length); i++) {
+      for (const q of qs) {
+        const x = q[i];
+        if (!x || seen.has(key(x.code))) continue;
+        seen.add(key(x.code));
+        out.push(x.code);
+        if (out.length >= need) break;
+      }
+    }
   }
   return out;
 }
 
-/** 模型活性回传：思考中/正在写 + 已多少字 + 已多久。没有它，长调用与死机无从分辨。 */
-const tickOf = (onEvent, scope) => (t) => onEvent?.({ type: 'tick', scope, ...t });
+// 外部知识条目规整（分层数字规则 L3）的唯一实现在 verdict.js，两张榜共用。
+// 这里只转出去——本轮刚删掉过一个分叉的重复实现（whitelistFromPrompt），不再制造第二个。
+export { normalizeExternal };
+
+/**
+ * 模型活性回传：思考中/正在写 + 已多少字 + 已多久。没有它，长调用与死机无从分辨。
+ * key 单独给（§5.1）：批内初筛是并行多批，每批一个单元；只有 scope 的话
+ * 台账会把所有批次数成一个「终裁」，批次并行度就看不出来了。
+ */
+const tickOf = (onEvent, scope, key) => (t) => onEvent?.({
+  type: 'tick', scope, key: key || scope, ...t, text: tickText(scope, t),
+});
 
 /**
  * 单次裁决（池子不大，或分批后的终裁）。
- * **top 为空是合法结论**（此刻一只都不值得买），不当作解析失败去重试——
- * 只要落选区把每只都讲清楚，就是一份完整结果。
+ * 榜单 minN~topN 席（v0.9.0）：达标不足下限时由「最接近达标」的补位并逐只标注。
+ * 下限按池子大小截断——池子只有 3 只时下限就是 3。
  */
-async function reviewOnce(profiles, { topN, onEvent, preScreened = null, tools = null } = {}) {
+async function reviewOnce(profiles, { topN, minN, onEvent, preScreened = null, tools = null, web = null } = {}) {
   const block = profiles.map((p, i) => renderProfile(p, i)).join('\n\n');
   const n = Math.min(topN, profiles.length);
+  const min = Math.min(minN, n);
+  const promoted = preScreened?.promoted || [];
+  const nameOf = (c) => profiles.find((p) => key(p.code) === key(c))?.name || c;
   const lead = preScreened
     ? `以下 ${profiles.length} 只是从用户自选池（共 ${preScreened.pool} 只）分 ${preScreened.batches} 批初筛后入围终裁的标的。`
       + `未入围的已在初筛阶段逐只给过落选理由，这里不必再提。`
+      + (promoted.length
+        ? `其中 ${promoted.map((c) => `${nameOf(c)}（${c}）`).join('、')} 在初筛被判落选，`
+          + `因为各批入围合计不足榜单下限 ${min} 只而补进终裁——请重新评估，仍不达标就作为补位标 meetsBar=false。`
+        : '')
     : `用户自选池共 ${profiles.length} 只。`;
-  const prompt = `${lead}请选出现在最值得买入的至多 ${n} 只并排序，`
-    + `其余每一只都要在 rejected 里给出三句话的理由与关键数据（一只都不能漏）。\n\n${block}`;
-  const system = SYS.replace(/\{\{TOP_N\}\}/g, String(n)) + (tools ? `\n\n${TOOL_GUIDE}` : '');
+  const prompt = `${lead}请给出 ${min}~${n} 只的榜单并排序（达标的最多 ${n} 只；不足 ${min} 只时用最接近达标的补位并标 meetsBar=false），`
+    + `其余每一只都要在 rejected 里给出三句话的理由与关键数据（一只都不能漏）。\n\n`
+    + (web ? `${renderResearch(web, profiles)}\n\n` : '')
+    + block;
+  const system = SYS
+    .replace(/\{\{BOARD_RULE\}\}/g, boardRule(min, n, '池内标的'))
+    .replace(/\{\{MIN_N\}\}/g, String(min))
+    .replace(/\{\{TOP_N\}\}/g, String(n)) + (tools ? `\n\n${TOOL_GUIDE}` : '');
 
   for (let attempt = 0; attempt <= NARRATIVE.schemaRetries; attempt++) {
     let r = null;
@@ -271,7 +356,7 @@ async function reviewOnce(profiles, { topN, onEvent, preScreened = null, tools =
           system, messages: [{ role: 'user', content: prompt }],
           tools: tools.defs, onToolCall: tr.handle,
           softToolCalls: tools.soft, maxToolCalls: tools.hard,
-          maxTokens: NARRATIVE.maxTokens,
+          maxTokens: NARRATIVE.maxTokens, scope: '终裁',
           onFallback: (f, t, why) => onEvent?.({ type: 'fallback', from: f, to: t, why }),
           onTick: tickOf(onEvent, '终裁'),
           onToolEvent: (e) => onEvent?.({ ...e, scope: '终裁' }),
@@ -281,13 +366,13 @@ async function reviewOnce(profiles, { topN, onEvent, preScreened = null, tools =
           maxTokens: NARRATIVE.maxTokens,
           onFallback: (f, t, why) => onEvent?.({ type: 'fallback', from: f, to: t, why }),
           onTick: tickOf(onEvent, '终裁'),
-        });
+        }, '终裁');
       const json = extractJson(r.text);
       if (!json || (!json.top?.length && !json.rejected?.length)) {
         dumpRaw('review', r, new Error(json ? '模型输出 top 与 rejected 均为空' : 'JSON 解析失败'));
         continue;
       }
-      const { top, rejected, externalNotes } = normalizeReview(json, profiles, { topN: n });
+      const { top, rejected, externalNotes } = normalizeReview(json, profiles, { topN: n, minN: min });
       if (!top.length && rejected.every((x) => x.unanswered)) {
         dumpRaw('review', r, new Error('模型输出的代码全部不在自选池内'));
         continue;
@@ -295,7 +380,7 @@ async function reviewOnce(profiles, { topN, onEvent, preScreened = null, tools =
       // 分层数字：L1 提示词 + L2 工具返回同为白名单；L3（externalNotes）不参与校验，
       // 它本来就是「模型自己的知识」，拿实测白名单去校验它等于不许它质疑数据。
       const text = [
-        ...top.map((x) => `${x.thesis} ${(x.killCriteria || []).join(' ')} ${(x.risks || []).join(' ')}`),
+        ...top.map((x) => `${x.thesis || ''} ${x.belowBarReason || ''} ${x.anchorWhy || ''} ${x.keyData || ''} ${(x.killCriteria || []).join(' ')} ${(x.risks || []).join(' ')}`),
         ...rejected.map((x) => `${x.why} ${x.keyData || ''}`),
       ].join(' ');
       const v = validateNumbers(text, whitelistOf(prompt + (tr ? '\n' + tr.text() : '')));
@@ -316,11 +401,11 @@ async function reviewOnce(profiles, { topN, onEvent, preScreened = null, tools =
 }
 
 /** 批内初筛：只分流（谁进终裁）+ 给落选者完整理由。不写投资逻辑，输出量因此可控。 */
-async function reviewBatch(profiles, { maxPicks, onEvent, label } = {}) {
+async function reviewBatch(profiles, { maxPicks, minN, onEvent, label } = {}) {
   const block = profiles.map((p, i) => renderProfile(p, i)).join('\n\n');
   const prompt = `这一批共 ${profiles.length} 只（已按行业聚拢）。请挑出最多 ${maxPicks} 只值得进入终裁的，`
     + `其余每一只都要在 rejected 里给出三句话的理由与关键数据（一只都不能漏）。\n\n${block}`;
-  const system = BATCH_SYS.replace(/\{\{MAX\}\}/g, String(maxPicks));
+  const system = BATCH_SYS.replace(/\{\{MAX\}\}/g, String(maxPicks)).replace(/\{\{MIN_N\}\}/g, String(minN));
 
   for (let attempt = 0; attempt <= NARRATIVE.schemaRetries; attempt++) {
     let r = null;
@@ -329,8 +414,8 @@ async function reviewBatch(profiles, { maxPicks, onEvent, label } = {}) {
         system, messages: [{ role: 'user', content: prompt }],
         maxTokens: NARRATIVE.maxTokens,
         onFallback: (f, t, why) => onEvent?.({ type: 'fallback', batch: label, from: f, to: t, why }),
-        onTick: tickOf(onEvent, label),
-      });
+        onTick: tickOf(onEvent, label, `batch:${label}`),
+      }, label);
       const json = extractJson(r.text);
       if (!json || (!json.picks?.length && !json.rejected?.length)) {
         dumpRaw('review-batch', r, new Error(json ? '模型输出 picks 与 rejected 均为空' : 'JSON 解析失败'));
@@ -359,14 +444,17 @@ async function reviewBatch(profiles, { maxPicks, onEvent, label } = {}) {
  * 自选池裁决。池子小就一次调用；超过 `NARRATIVE.watchBatchSize` 走两段式：
  * 批内初筛（并行）→ 终裁只处理入围的。
  *
- * 两段式的语义代价：「谁进 Top 8」先在批内比较、再做总排序，不再是全池严格同框
+ * 两段式的语义代价：「谁进榜」先在批内比较、再做总排序，不再是全池严格同框
  * ——与市场挖掘的粗筛→裁决同一个路子（用户决策 2026-09-23）。
  * 换来的是每次调用的输出量恒定：单次写 43 份结论实测直接写不出来。
  */
-export async function watchReview(profiles, { topN = SCREENING.watch.topN, onEvent, onProgress, rows = null } = {}) {
+export async function watchReview(profiles, {
+  topN = SCREENING.watch.topN, minN = SCREENING.watch.minN, onEvent, onProgress, rows = null,
+} = {}) {
   if (!profiles.length) return { ok: false, reason: '自选池内没有可裁决的标的' };
   const known = new Map(profiles.map((p) => [key(p.code), p]));
-  const base = { scope: 'watch', pool: profiles.length, topN, profiles: known };
+  // minN 回写的是**生效值**（池子不足下限时被截断），渲染层据此说「至少几只」
+  const base = { scope: 'watch', pool: profiles.length, topN, minN: Math.min(minN, profiles.length), profiles: known };
 
   // 终裁的取数工具。批内初筛**不开工具**（用户决策）——它只做分流，
   // 输出量要可控；深度留给终裁。byCode 用 profiles，保证模型只能对池内标的取数。
@@ -376,11 +464,18 @@ export async function watchReview(profiles, { topN = SCREENING.watch.topN, onEve
 
   // ── 小池子：一次调用，全池同框比较 ────────────────────────────
   if (profiles.length <= NARRATIVE.watchBatchSize) {
+    // 联网研究（v0.11.0）：小池子全员都进终裁，也就全员都研究。串在终裁之前——
+    // 终裁要拿着研究结论下判断，所以这一段的耗时会直接加到总耗时上（上限 20 分钟）
+    onProgress?.({ phase: 'research', done: 0, total: profiles.length });
+    const web = await runResearch(profiles, { onEvent });
     onProgress?.({ phase: 'final', done: 0, total: 1 });
-    const r = await reviewOnce(profiles, { topN, onEvent, tools });
+    const r = await reviewOnce(profiles, { topN, minN, onEvent, tools, web });
     onProgress?.({ phase: 'final', done: 1, total: 1 });
-    if (!r.ok) return { ...base, ok: false, reason: r.reason, calls: 1 };
-    return { ...base, ...r, batches: 1, calls: 1, unanswered: r.rejected.filter((x) => x.unanswered).length };
+    if (!r.ok) return { ...base, ok: false, reason: r.reason, calls: 1, research: compactResearch(web) };
+    return {
+      ...base, ...r, batches: 1, calls: 1, unanswered: r.rejected.filter((x) => x.unanswered).length,
+      research: compactResearch(web),
+    };
   }
 
   // ── 大池子：批内初筛（并行）→ 终裁 ───────────────────────────
@@ -391,13 +486,20 @@ export async function watchReview(profiles, { topN = SCREENING.watch.topN, onEve
   // runPool 把抛出的异常吞成 null（见 util.js），这里按「整批失败」处理：
   // 该批的票会在最后的全池兜底里被标成「模型未给结论」，不会凭空消失
   const results = await runPool(batches, NARRATIVE.concurrency, async (rows, i) => {
-    const r = await reviewBatch(rows, { maxPicks, onEvent, label: `第${i + 1}批` });
+    const r = await reviewBatch(rows, { maxPicks, minN, onEvent, label: `第${i + 1}批` });
     onProgress?.({ phase: 'batch', done: ++done, total: batches.length });
     return r;
   }).then((rs) => rs.map((r, i) => r || { ok: false, label: `第${i + 1}批`, reason: '批次异常终止' }));
 
   const picked = new Set();
   for (const r of results) if (r.ok) for (const c of r.picks) if (known.has(key(c))) picked.add(key(c));
+  // 下限补足（v0.9.0）：各批入围合计不足榜单下限时，终裁手里根本没有 5 只可排，
+  // 所以要在进终裁之前从各批落选区轮流补人，而不是让终裁去补它看不见的票。
+  const promoted = promoteForFloor(
+    results.filter((r) => r.ok).map((r) => normalizeRejected(r.rejected, known, picked)),
+    picked, Math.min(minN, profiles.length) - picked.size,
+  );
+  for (const c of promoted) picked.add(key(c));
   const seen = new Set();
   let batchRejected = [];
   let suspect = [];
@@ -409,7 +511,7 @@ export async function watchReview(profiles, { topN = SCREENING.watch.topN, onEve
   }
   const shortlist = profiles.filter((p) => picked.has(key(p.code)));
 
-  // 一只都没入围：合法结论（池内此刻没有值得买的），无需终裁
+  // 一只都没入围：只在下限为 0（环境变量关掉）或各批全部失败时才会走到这里
   if (!shortlist.length) {
     const rejected = completeCoverage([], batchRejected, profiles);
     return {
@@ -421,12 +523,18 @@ export async function watchReview(profiles, { topN = SCREENING.watch.topN, onEve
     };
   }
 
+  // 联网研究只覆盖入围终裁的这几只——批内初筛不联网（用户决策 2026-09-27），
+  // 与「批内初筛不开取数工具」同一条边界
+  onProgress?.({ phase: 'research', done: 0, total: shortlist.length });
+  const web = await runResearch(shortlist, { onEvent });
   onProgress?.({ phase: 'final', done: 0, total: 1, shortlist: shortlist.length });
   const final = await reviewOnce(shortlist, {
-    topN, onEvent, tools, preScreened: { pool: profiles.length, batches: batches.length },
+    topN, minN, onEvent, tools, web, preScreened: { pool: profiles.length, batches: batches.length, promoted },
   });
   onProgress?.({ phase: 'final', done: 1, total: 1 });
-  if (!final.ok) return { ...base, ok: false, reason: final.reason, calls: batches.length + 1, batchFailed };
+  if (!final.ok) {
+    return { ...base, ok: false, reason: final.reason, calls: batches.length + 1, batchFailed, research: compactResearch(web) };
+  }
 
   // 终裁的落选 + 各批的落选，再对全池兜底
   const rejected = completeCoverage(final.top, [...final.rejected, ...batchRejected], profiles);
@@ -435,6 +543,12 @@ export async function watchReview(profiles, { topN = SCREENING.watch.topN, onEve
     top: final.top, rejected, note: final.note,
     suspectNumbers: [...(final.suspectNumbers || []), ...suspect],
     batches: batches.length, calls: batches.length + 1, shortlist: shortlist.length,
+    promoted: promoted.length ? promoted : undefined,
+    // 取数与三段式那条同理：必须带出去，否则分不出「终裁自己查了 19 次」与
+    // 「一次都没查」（顶层 toolCalls 为 undefined 时的差异，实测被显示成 0）
+    toolCalls: final.toolCalls || 0, toolLog: final.toolLog || [],
+    toolsDisabled: final.toolsDisabled, budgetExhausted: final.budgetExhausted,
     batchFailed, unanswered: rejected.filter((x) => x.unanswered).length,
+    research: compactResearch(web),
   };
 }

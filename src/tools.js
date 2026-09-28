@@ -1,4 +1,4 @@
-// 细筛的取数工具集（SYSTEM_DEFINITION §3.4）。
+// 细筛的取数工具集（SYSTEM_DEFINITION §2.7）。
 //
 // 为什么存在：细筛此前只能在机械层给定的档案里排序——问它「这个便宜是错杀还是陷阱」，
 // 手上却只有估值与财务比率，行业格局、竞争动态、管理层表述一个字都没有。
@@ -24,16 +24,22 @@ const yi = (v) => (v == null || !isFinite(v) ? '—' : (v / 1e8).toFixed(1) + '�
 export const TOOL_DEFS = [
   {
     name: 'get_filing',
-    description: '取该公司最近年报/半年报（美股 10-K）的指定章节正文。'
+    description: '取该公司最近年报/半年报（美股 10-K 或 10-Q）的指定章节正文。'
       + '这是唯一能拿到管理层自述的行业判断、经营解释与风险披露的工具——'
-      + '档案里的财务数字回答不了「这个便宜是错杀还是陷阱」，这里的正文可以。',
+      + '档案里的财务数字回答不了「这个便宜是错杀还是陷阱」，这里的正文可以。'
+      + '美股年报可能已是半年多前的事：想知道最近一个季度管理层怎么说，用 form=10-Q。',
     input_schema: {
       type: 'object',
       properties: {
         code: { type: 'string', description: '标的代码，须是候选清单里出现过的代码' },
         section: {
           type: 'string', enum: ['mdna', 'risk', 'business'],
-          description: 'mdna=管理层讨论与分析（首选）；risk=风险因素；business=业务描述（仅美股）',
+          description: 'mdna=管理层讨论与分析（首选）；risk=风险因素（10-Q 里通常只写相对年报的变化）；'
+            + 'business=业务描述（仅美股 10-K）',
+        },
+        form: {
+          type: 'string', enum: ['10-K', '10-Q'],
+          description: '仅美股：10-K=最近年报（默认）；10-Q=最近季报。A股忽略此参数（自动取最近的年报/半年报）',
         },
       },
       required: ['code', 'section'],
@@ -41,8 +47,9 @@ export const TOOL_DEFS = [
   },
   {
     name: 'get_statements',
-    description: '取最近 8 期三大报表的关键行（营收/毛利/营业利润/净利/经营现金流/资本开支/'
-      + '总资产/净资产/有息负债/现金/存货/应收）。用于验证趋势与现金流质量。',
+    description: '取最近 12 期报表的关键行（营收/毛利/营业利润/净利/经营现金流/资本开支/'
+      + '总资产/净资产/有息负债/现金/存货/应收）。用于验证趋势与现金流质量。'
+      + 'A股 含季报（累计口径）；美股为 12 期年报 + 最近 8 个单季（单季只有利润表）。',
     input_schema: {
       type: 'object',
       properties: { code: { type: 'string' } },
@@ -93,14 +100,14 @@ export const TOOL_DEFS = [
       type: 'object',
       properties: {
         code: { type: 'string', description: '以该标的所属行业取同业' },
-        limit: { type: 'number', description: '返回条数，默认 15' },
+        limit: { type: 'number', description: '返回条数，默认 20，最多 50' },
       },
       required: ['code'],
     },
   },
   {
     name: 'get_price_series',
-    description: '取复权月线序列（最近 60 个月的收盘）。用于看下跌的**形态与起点**——'
+    description: '取复权月线序列（最近 120 个月的收盘）。用于看下跌的**形态与起点**——'
       + '档案里只有几个区间数字，看不出是一次性跳水还是慢刀子。',
     input_schema: {
       type: 'object',
@@ -120,7 +127,7 @@ async function statementsText(row) {
     : await em.statementsUS(row.code, em.usSuffix(row.mk)).catch(() => null);
   const rows = (cn ? st : st?.annual) || [];
   if (!rows.length) return `报表不可得（${cn ? '东财 A股 三大报表' : '东财美股年报'}返回为空）`;
-  const use = rows.slice(0, 8);
+  const use = rows.slice(0, 12);   // v0.10.0：8 → 12 期（总量由上下文预算兜底）
   const L = [`${row.name}（${row.code}）报表关键行，共 ${use.length} 期，新→旧`];
   if (cn) L.push('⚠ A股 季度数据是**累计**口径：03-31/06-30/09-30 为年初至今，不是单季');
   const cols = cn
@@ -134,6 +141,17 @@ async function statementsText(row) {
   for (const [label, key] of cols) {
     L.push([label.padEnd(12), ...use.map((r) => yi(r[key]).padStart(12))].join(''));
   }
+  // 美股单季（v0.11.0）：此前这里只给年报，年报之后的季度模型一个都看不到，
+  // 而东财单季报其实已经取回来了。单季只有利润表，资产负债表仍以年报为准
+  const q = cn ? [] : (st?.quarterly || []).slice(0, 8);
+  if (q.length) {
+    L.push('', `最近 ${q.length} 个单季（利润表，新→旧；资产负债与现金流见上方年报）`);
+    L.push(['科目'.padEnd(12), ...q.map((r) => String(r.period).padStart(12))].join(''));
+    for (const [label, key] of [['营收', 'revenue'], ['毛利', 'grossProfit'], ['营业利润', 'operateProfit'], ['归母净利', 'parentNetProfit']]) {
+      L.push([label.padEnd(12), ...q.map((r) => yi(r[key] ?? (key === 'parentNetProfit' ? r.netProfit : null)).padStart(12))].join(''));
+    }
+    L.push(['EPS'.padEnd(12), ...q.map((r) => f(r.eps).padStart(12))].join(''));
+  }
   return L.join('\n');
 }
 
@@ -142,7 +160,7 @@ async function mainIndicatorsText(row) {
   if (row.market !== 'cn') return '该工具仅 A股 可用：美股没有对应数据源（东财 MAINFINADATA 是 A股 专有）。美股请用 get_concept_series。';
   const rows = await em.mainIndicators(row.code).catch(() => []);
   if (!rows.length) return '主要财务指标不可得（MAINFINADATA 返回为空）';
-  const use = rows.slice(0, 6);
+  const use = rows.slice(0, 10);   // v0.10.0：6 → 10 期
   const L = [`${row.name}（${row.code}）主要财务指标，共 ${use.length} 期，新→旧`];
   const fields = [
     ['ROE(加权%)', 'roe'], ['扣非ROE%', 'roeDeduct'], ['ROIC%', 'roic'], ['ROA%', 'roa'],
@@ -227,9 +245,9 @@ async function valuationSummaryText(row) {
  * 因此回落到 em.universe()：单次请求、缓存 6 小时，不破坏该前提，
  * 代价是只有行情与 ROE，没有毛利率/负债率/回撤。字段来源如实标注。
  */
-async function peersText(row, ctx, limit = 15) {
+async function peersText(row, ctx, limit = 20) {
   const ind = row.industry;
-  const n = Math.min(Number(limit) || 15, 30);
+  const n = Math.min(Number(limit) || 20, 50);
   const same = (all) => (all || []).filter((r) => r.industry === ind && String(r.code) !== String(row.code));
 
   let pool = same(ctx.rows);
@@ -258,7 +276,7 @@ async function peersText(row, ctx, limit = 15) {
 }
 
 /**
- * 复权月线，最近 60 个月。看下跌的形态与起点。
+ * 复权月线，最近 120 个月。看下跌的形态与起点。
  *
  * **必须以现价重新锚定**。后复权序列只适合算比值，直接展示会害人：
  * 茅台后复权 2021-10 是 9661.08，模型会读成「当时股价 9661 元」（实际约 1800）。
@@ -267,7 +285,7 @@ async function peersText(row, ctx, limit = 15) {
 async function priceSeriesText(row) {
   const pack = await adjustedMonthly(row).catch(() => null);
   if (!pack?.usable) return `价格序列不可用（${pack?.reason || '取不到'}）`;
-  const use = pack.rows.slice(-60);
+  const use = pack.rows.slice(-120);   // v0.10.0：5 年 → 10 年月线
   if (!use.length) return '价格序列为空';
   const lastAdj = use[use.length - 1].close;
   const anchor = row.price != null && isFinite(row.price) && lastAdj > 0 ? row.price / lastAdj : 1;
@@ -284,11 +302,15 @@ async function priceSeriesText(row) {
 }
 
 /** 财报/公告章节正文。两个市场分别走各自的抽取路径。 */
-async function filingText(row, section) {
+async function filingText(row, section, form) {
   const kind = ['mdna', 'risk', 'business'].includes(section) ? section : 'mdna';
+  const fm = String(form || '').toUpperCase() === '10-Q' ? '10-Q' : '10-K';
+  if (row.market !== 'cn' && fm === '10-Q' && kind === 'business') {
+    return '10-Q 没有「业务描述」章节：业务描述只在 10-K 里（form=10-K, section=business）。';
+  }
   const r = row.market === 'cn'
     ? await filingSectionCN(row.code, { kind: kind === 'business' ? 'mdna' : kind })
-    : await filingSectionUS(row.code, { kind });
+    : await filingSectionUS(row.code, { kind, form: fm });
   if (!r.ok) {
     return `${kind} 章节不可得：${r.reason}`
       + (r.available ? `\n可选公告：${r.available.join('；')}` : '')
@@ -298,6 +320,8 @@ async function filingText(row, section) {
     + (r.endUnbounded ? '\n⚠ 未找到章节结束标记，以下内容可能混入后续章节' : '')
     + (r.fallback ? '\n⚠ 这不是章节抽取结果：该报告没有使用标准章节标题，'
       + '以下是报告正文开头几页，请自行判断其中有多少与你要问的问题相关' : '')
+    + (r.rescued ? '\n⚠ 该章节标题紧挨着其他很短的章节，按「标题后是正文而不是页码」定位，请留意起止是否正确' : '')
+    + (r.long ? `\n⚠ 章节很长（${r.chars} 字符），超出单次返回上限的部分会被截断——风险因素一般按重要性排序` : '')
     + `\n\n${r.text}`;
 }
 
@@ -320,7 +344,7 @@ export function buildTools(ctx = {}) {
         + '只能对清单里出现过的代码取数——避免把分析扩散到没有经过收集的标的。';
     }
     switch (name) {
-      case 'get_filing': return filingText(row, input.section);
+      case 'get_filing': return filingText(row, input.section, input.form);
       case 'get_statements': return statementsText(row);
       case 'get_main_indicators': return mainIndicatorsText(row);
       case 'get_concept_series': return conceptText(row, input.concept);

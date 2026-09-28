@@ -13,18 +13,22 @@ export function isFinancial(industry = '', market = 'cn') {
   return market === 'us' ? US_FINANCIAL.test(industry) : CN_FINANCIAL.test(industry);
 }
 
-/** 主倍数路由（§2.3 步骤 3）。 */
-export function multipleRoute({ industry, market, cyclical, normEps }) {
+/**
+ * 机械默认口径（§2.3 步骤 3）。v0.10.0 起**只按「哪个倍数算得出来」选**，不判股性：
+ * 金融股的 EBIT 归一化不成立 → PB；归一化 EPS ≤ 0 时 PE 无意义 → PS；其余 → 归一化 PE。
+ * 此前这里还有一条「周期股 → PB」，已删除（理由见 normalize.js fundamentalHistory）。
+ *
+ * 只剩单股分析的机械段落（多视角、档位、置信度）还用它。挖掘两条流水线不用默认口径：
+ * 所有锚并排给模型，由模型选（valuation.js anchorsFor / resolveAnchor）。
+ */
+export function multipleRoute({ industry, market, normEps }) {
   if (isFinancial(industry, market)) {
-    return { kind: 'financial', primary: 'pb', check: 'dividend', reason: '金融股：PB 分位为主' };
+    return { kind: 'financial', primary: 'pb', check: 'dividend', reason: '机械默认口径（未判股性）：金融股 PB 分位' };
   }
   if (normEps == null || normEps <= 0) {
-    return { kind: 'loss', primary: 'ps', check: 'pb', reason: '归一化 EPS ≤ 0：PS 分位为主，仅给保守档并降置信度' };
+    return { kind: 'loss', primary: 'ps', check: 'pb', reason: '机械默认口径（未判股性）：归一化 EPS ≤ 0，PS 分位' };
   }
-  if (cyclical) {
-    return { kind: 'cyclical', primary: 'pb', check: 'ps', reason: '周期股：底部 PE 失真，改用 PB 分位' };
-  }
-  return { kind: 'general', primary: 'pe', check: 'pb', reason: '一般工商企业：归一化 PE 分位为主' };
+  return { kind: 'general', primary: 'pe', check: 'pb', reason: '机械默认口径（未判股性）：归一化 PE 分位' };
 }
 
 export const industryKey = (u) => u.industry || '未分类';
