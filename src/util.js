@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import dns from 'node:dns';
 import { fileURLToPath } from 'node:url';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -11,6 +12,20 @@ fs.mkdirSync(CACHE_DIR, { recursive: true });
 export const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 export const SEC_UA = process.env.SEC_USER_AGENT || 'my-stock-mining/0.2 (research; set SEC_USER_AGENT to override)';
+
+// ── DNS 解析顺序：默认 IPv4 优先（2026-09-28 实测定案）──────────────────
+// 东财 push2 / datacenter、腾讯 qt.gtimg、SEC 全部同时有 A 与 AAAA 记录，macOS 默认把 IPv6
+// 地址排在前面。实测北京移动线路上，push2 三个域名的 IPv6 都能建连、能完成 TLS，普通路径
+// 还会正常回 404，唯独 `/api/qt/...` 请求一到就被服务端关闭连接（IPv6 前端的应用层拒绝，不是
+// 线路不通）。TCP 已经连上，Node 的 Happy Eyeballs 不会再回退到 IPv4，undici 只抛一句裸的
+// `fetch failed`（cause=UND_ERR_SOCKET），「拉取全市场列表」2 秒内整轮报错。
+// 定位手法：同一 URL `curl -4` 200、`curl -6` 空响应。所有数据源 IPv4 均可达，进程级改成
+// IPv4 优先没有代价；按域名白名单则每加一个源都要记得补。纯 IPv6 环境用
+// MINE_DNS_ORDER=ipv6first|verbatim 覆盖。必须在任何 fetch 之前生效，故放在本模块顶层。
+const DNS_ORDERS = ['ipv4first', 'ipv6first', 'verbatim'];
+const dnsOrder = process.env.MINE_DNS_ORDER || 'ipv4first';
+if (DNS_ORDERS.includes(dnsOrder)) dns.setDefaultResultOrder(dnsOrder);
+else console.warn(`[net] MINE_DNS_ORDER=${dnsOrder} 不在 ${DNS_ORDERS.join('|')} 之内，沿用系统默认解析顺序`);
 
 const sha = (s) => crypto.createHash('sha1').update(s).digest('hex').slice(0, 20);
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -34,6 +49,27 @@ export async function cached(key, ttlMs, producer) {
   return v;
 }
 
+/**
+ * 把 undici 的裸 `fetch failed` / 超时 AbortError 翻成能定位的话。
+ * 原样抛出去，界面上只剩「fetch failed」，主机是谁、是断连还是超时全看不见
+ * （2026-09-28 IPv6 断连那次就是这样多查了一圈）。HTTP 层错误本来就带 URL 与 status，
+ * 原样保留——调用方还靠 e.status / e.fatal 判断 404 要不要重试。
+ */
+function describeNetErr(e, url, timeout) {
+  if (e == null || e.status != null) return e;
+  let host = url;
+  try { host = new URL(url).host; } catch {}
+  const code = e.cause?.code || e.code;
+  if (e.name === 'AbortError') {
+    // DOMException 的 message 是只读访问器，就地改会在严格模式下抛错，换成普通 Error
+    return Object.assign(new Error(`请求超时 ${timeout}ms · ${host}`), { cause: e, code: 'ETIMEDOUT' });
+  }
+  if (code && !String(e.message).includes(code)) {
+    return Object.assign(new Error(`${e.message}（${code}）· ${host}`), { cause: e.cause || e, code });
+  }
+  return e;
+}
+
 /** 带超时 + 指数退避重试的 fetch，返回文本。 */
 export async function fetchText(url, opts = {}) {
   const { headers = {}, timeout = 20000, retries = 3, method = 'GET', body } = opts;
@@ -50,7 +86,7 @@ export async function fetchText(url, opts = {}) {
       if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status} ${url}`), { status: res.status, fatal: res.status === 404 });
       return await res.text();
     } catch (e) {
-      lastErr = e;
+      lastErr = describeNetErr(e, url, timeout);
       if (e.fatal || attempt === retries) break;
       await sleep(400 * 2 ** attempt + Math.random() * 250);
     } finally { clearTimeout(timer); }

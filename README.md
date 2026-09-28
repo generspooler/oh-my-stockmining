@@ -114,6 +114,10 @@ UNH   归一化 EPS $32.61        实际 EPS $13.23
 ## 踩过的坑
 
 - 东财 clist 的 `f2`（最新价）在美股缩放不一致（NVDA ÷1000、BRK.A ÷100），**不可用**。
+- **东财域名走 IPv6 会「连上就断」**（实测北京移动，2026-09-28）：push2 三个域名都有 AAAA 记录，
+  IPv6 上 TLS 握手成功、收到请求即关闭，Node 不回退 IPv4，只报一句 `fetch failed`。
+  已在 `src/util.js` 进程级改为 IPv4 优先（`MINE_DNS_ORDER=ipv6first|verbatim` 覆盖）。
+  再遇到 `fetch failed`，先拿同一 URL `curl -4` / `curl -6` 各试一次。
 - `LOAN_PROVISION_RATIO` 是拨贷比（2.8%），拨备覆盖率是 `BLDKBBL`（217%）。
 - SEC frames 的资产负债表科目要用 `CY2025Q4I`（时点），利润表现金流用 `CY2025`（区间），
   混用会全部取空。

@@ -14,16 +14,22 @@ const d10 = (s) => (s ? String(s).slice(0, 10) : null);
 const PUSH_HOSTS = ['push2.eastmoney.com', '82.push2.eastmoney.com', 'push2delay.eastmoney.com'];
 async function push(path, host0) {
   let lastErr;
-  for (const host of host0 ? [host0, ...PUSH_HOSTS] : PUSH_HOSTS) {
+  const hosts = host0 ? [host0, ...PUSH_HOSTS] : PUSH_HOSTS;
+  for (const host of hosts) {
     try {
       const d = await fetchJson(`https://${host}${path}`, {
         headers: { Referer: 'https://quote.eastmoney.com/' }, retries: 1, timeout: 15000,
       });
       if (d?.data) return d;
-      lastErr = new Error('空响应');
+      lastErr = new Error(`空响应 · ${host}`);
     } catch (e) { lastErr = e; }
   }
-  throw lastErr;
+  // 几个域名共用同一套解析与线路，一个不通往往个个不通（IPv6 断连那次就是）。
+  // 报错时把「全部失败」说清楚，别让调用方以为只是最后那台挂了。
+  throw Object.assign(
+    new Error(`东财行情 ${hosts.length} 个域名均失败 · 最后一次：${lastErr?.message || '空响应'}`),
+    { cause: lastErr },
+  );
 }
 
 /** datacenter 分页拉取，自动翻页到 maxPages。 */
@@ -74,15 +80,28 @@ export async function universe(market, { includeBeijing = false } = {}) {
     })}`);
     const total = first?.data?.total || 0;
     const pages = Math.ceil(total / 100);
-    const rest = await pool(
-      Array.from({ length: Math.max(0, pages - 1) }, (_, i) => i + 2),
-      LIMITS.emConcurrency,
-      (pn) => push(`/api/qt/clist/get?${qs({
-        pn, pz: 100, po: 1, np: 1, fid: 'f20', fs,
-        fields: UNIVERSE_FIELDS,
-      })}`).then((d) => d?.data?.diff || []).catch(() => []),
-    );
-    const rows = [first?.data?.diff || [], ...rest.map((r) => r || [])].flat();
+    const page = (pn) => push(`/api/qt/clist/get?${qs({
+      pn, pz: 100, po: 1, np: 1, fid: 'f20', fs,
+      fields: UNIVERSE_FIELDS,
+    })}`).then((d) => d?.data?.diff || []);
+    // 单页失败此前静默当空页：几页被断连就得到一份**残缺**清单，而且不是空数组，
+    // cached() 会当成正常结果写盘 6 小时——下游表现为自选票莫名「未在全市场列表中找到」、
+    // 粗筛少一批票也没人知道。现在失败页串行再试一轮，仍失败就整体报错并说明第几页：
+    // 与 cached()「失败结果不写盘」同一原则，残缺清单比没有清单更害人。
+    const pns = Array.from({ length: Math.max(0, pages - 1) }, (_, i) => i + 2);
+    const rest = await pool(pns, LIMITS.emConcurrency, page);   // pool 把失败项记为 null，空页是 []
+    let lastErr = null;
+    for (const pn of pns) {
+      if (rest[pn - 2] != null) continue;
+      try { rest[pn - 2] = await page(pn); } catch (e) { lastErr = e; }
+    }
+    const failed = pns.filter((pn) => rest[pn - 2] == null);
+    if (failed.length) {
+      throw new Error(`全市场列表拉取不完整：${failed.length}/${pages} 页失败`
+        + `（第 ${failed.slice(0, 5).join('、')}${failed.length > 5 ? '…' : ''} 页）`
+        + (lastErr ? ` · ${lastErr.message}` : ''));
+    }
+    const rows = [first?.data?.diff || [], ...rest].flat();
     const seen = new Set();
     return rows.filter((r) => r?.f12 && !seen.has(r.f12) && seen.add(r.f12)).map((r) => ({
       code: r.f12,
