@@ -184,7 +184,7 @@ async function cmdMine(market = 'cn') {
     console.log(`\n${String(x.rank).padStart(2)}. ${p.name}（${x.code}）${p.industry || ''}${x.meetsBar === false ? '  ［未达标 · 机制补位］' : ''}`);
     console.log(`    ${cur}${p.price?.toFixed(2) ?? '—'} ｜ ${mosText(p, x)} ｜ ${x.attribution ? `归因 ${x.attribution}` : `状态 ${x.stance || '—'}`}`);
     belowBarLines(x, v).forEach((l) => console.log(l));
-    if (x.thesis) console.log(`    ${x.thesis}`);
+    pitchLines(x).forEach((l) => console.log(l));
     anchorLines(p, x).forEach((l) => console.log(l));
     if (x.catalyst) console.log(`    催化剂：${x.catalyst}`);
     (x.killCriteria || []).forEach((k) => console.log(`    ⊘ ${k}`));
@@ -280,6 +280,14 @@ function belowBarLines(x, v) {
   ];
 }
 
+/** 榜单条目的两层叙述（§3.1.2）：开篇 pitch 在前（保留三段换行），thesis 折进「核实与细节」。 */
+function pitchLines(x) {
+  const out = [];
+  if (x.pitch) for (const l of String(x.pitch).split('\n')) out.push(`    ${l}`.trimEnd());
+  if (x.thesis) out.push(x.pitch ? `    核实与细节：${x.thesis}` : `    ${x.thesis}`);
+  return out;
+}
+
 /**
  * 自选池挖掘（三阶段，与全市场挖掘彻底分开）。
  * 编排在 src/watchRun.js，与网页端共用一份——这里只负责把结果打到终端。
@@ -328,7 +336,7 @@ async function cmdWatchMine(market = 'cn') {
       + `${x.meetsBar === false ? '  ［未达标 · 机制补位］' : ''}`);
     console.log(`    ${cur}${p.price?.toFixed(2) ?? '—'} ｜ ${mosText(p, x)} ｜ ${x.attribution ? `归因 ${x.attribution}` : `状态 ${x.stance || '—'}`}`);
     belowBarLines(x, v).forEach((l) => console.log(l));
-    if (x.thesis) console.log(`    ${x.thesis}`);
+    pitchLines(x).forEach((l) => console.log(l));
     anchorLines(p, x).forEach((l) => console.log(l));
     if (x.keyData) console.log(`    关键数据：${x.keyData}`);
     if (x.catalyst) console.log(`    催化剂：${x.catalyst}`);

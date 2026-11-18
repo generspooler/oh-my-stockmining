@@ -139,6 +139,8 @@ details.pick[open] .one{display:none}
 .caret{color:var(--dim);font-size:11px;margin-left:6px}
 details.pick[open] .caret{transform:rotate(90deg);display:inline-block}
 .body{padding:0 0 14px}
+.pitch{white-space:pre-line;margin:2px 0 10px}
+.fine{font-size:13px;color:var(--dim);white-space:pre-line;margin:6px 0 0}
 .dd{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--dim);margin:8px 0}
 /* ── 历史 Timeline ──────────────────────────────────── */
 details.hist{background:var(--card);border:1px solid var(--line);border-radius:8px;margin-bottom:14px}
@@ -757,7 +759,7 @@ function renderTop(d){
     // 模型判达标、但按 F-Score 分档的要求安全边际还差一截（v0.11.3）：只标注，不改判
     const lm=x.belowRequiredMos;
     const lmTag=lm?` <span class="y" title="所选锚的安全边际低于同 F-Score 的参考门槛，由模型判定达标——参考门槛只作参照">低于参考门槛 ${pct(lm.actual)}&lt;${pct(lm.required)}</span>`:'';
-    const first=String(x.thesis||x.belowBarReason||'').split(/(?<=[。！？])/)[0]||'';
+    const first=String(x.pitch||x.thesis||x.belowBarReason||'').split(/(?<=[。！？])/)[0]||'';
     // 自选榜标「不在挖掘池内」（口径适配有限）；市场榜标「已自选」（这只你在盯）
     const grp=watch?(p.outOfPool?'<span class="grp grpM">不在挖掘池内</span>':'')
       :legacy?(x.group==='自选'?'<span class="grp grpW">自选</span>':'<span class="grp grpM">市场</span>')
@@ -781,7 +783,7 @@ function renderTop(d){
         ${bb?`<div class="y">⚠ 未达买入标准——榜单${v.minN!=null?'至少 '+v.minN+' 只':'有席位下限'}，达标的不够，它作为最接近达标的补位进榜，<b>不是推荐</b>。`
           +(x.filledBy==='code'?'（模型没有把它排进榜，由系统按「离达标由近到远」的次序补位，因此没有完整投资逻辑。）':'')
           +`<br>差在哪：${esc(x.belowBarReason||'模型未写明')}</div>`:''}
-        ${x.thesis?`<p>${esc(x.thesis)}</p>`:''}
+        ${x.pitch?`<p class="pitch">${esc(x.pitch)}</p>`:(x.thesis?`<p>${esc(x.thesis)}</p>`:'')}
         ${x.keyData?`<div class="dim">关键数据：${esc(x.keyData)}</div>`:''}
         ${ddRow(p)}
         ${stockTypeRow(x)}
@@ -791,6 +793,7 @@ function renderTop(d){
         ${(x.risks||[]).length?'<div class="dim">关键风险：<ul>'+x.risks.map(r=>'<li>'+esc(r)+'</li>').join('')+'</ul></div>':''}
         ${(x.killCriteria||[]).length?'<div class="y">否决条件（满足即结论作废）：<ul>'+x.killCriteria.map(k=>'<li>'+esc(k)+'</li>').join('')+'</ul></div>':''}
         ${x.valuationCaveat?'<div class="y">⚠ 估值提醒：'+esc(x.valuationCaveat)+'</div>':''}
+        ${x.pitch&&x.thesis?`<details class="cb"><summary>▸ 核实与细节（口径、经营数据与归因推理）</summary><p class="fine">${esc(x.thesis)}</p></details>`:''}
         ${webRow(webOf(v.research,x.code))}
         ${x.suggestRemove?'<div class="y">⚠ 建议移出自选池 —— 系统不代删，要移请点上面池子里的 ✕</div>':''}
       </div>

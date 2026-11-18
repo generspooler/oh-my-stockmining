@@ -15,7 +15,7 @@
 // 「批内先筛 → 终裁只处理入围的」后，每次调用的输出量都与市场裁决相当。
 import { complete, completeWithTools, extractJson, validateNumbers, whitelistOf, dumpRaw, tickText } from './llm.js';
 import {
-  fitBoard, boardRule, BOARD_FIELDS, ANCHOR_FIELDS, CRITERIA, NUMBER_RULE, withValuation, normalizeExternal,
+  fitBoard, boardRule, BOARD_FIELDS, ANCHOR_FIELDS, CRITERIA, NUMBER_RULE, PITCH_RULE, withValuation, normalizeExternal,
 } from './verdict.js';
 import { runResearch, renderResearch, compactResearch } from './research.js';
 import { resolveAnchor } from './valuation.js';
@@ -81,6 +81,8 @@ ${COMMON}
 硬约束：进榜的每只必须给出**否决条件**：写明「若 X 发生则本结论作废」。
 无法证伪的看多理由不予采纳。
 
+${PITCH_RULE}
+
 只输出 JSON：
 {
   "top": [
@@ -90,7 +92,8 @@ ${COMMON}
       ${ANCHOR_FIELDS}
       "stance": "仅 meetsBar 为 false 时填写：估值已修复/等待催化/基本面待验证/疑似价值陷阱/数据不足",
       "attribution": "周期性底部/一次性事件冲击/流动性情绪杀/治理折价/盈利跑赢股价/结构性衰退/商业模式证伪/暂不归类",
-      "thesis": "投资逻辑，三到四句",
+      "pitch": "开篇：三问各成一段（为什么值得拥有/为什么是现在/一句话最大前提），≤500字，写给投资人",
+      "thesis": "核实与细节：支撑开篇的验证过程——口径调整、关键经营数据、归因推理",
       "killCriteria": ["若X发生则结论作废", "..."],
       "risks": ["关键风险 2-3 条"],
       "catalyst": "价值实现路径；无则写'无可见催化剂，需要耐心'",
@@ -231,13 +234,13 @@ function droppedToRejected(x, topN, anchors) {
   if (x.droppedWhy === 'overMax') {
     return {
       ...val, code: x.code, stance: '达标但超出席位',
-      why: `模型判为达标，但达标标的超过 ${topN} 席上限，按模型排序被截去。${firstSentence(x.thesis)}`,
+      why: `模型判为达标，但达标标的超过 ${topN} 席上限，按模型排序被截去。${firstSentence(x.pitch || x.thesis)}`,
       keyData: null, suggestRemove: false,
     };
   }
   return {
     ...val, code: x.code, stance: x.stance || '未归类',
-    why: x.belowBarReason || x.thesis || '模型判为未达标；达标标的已满足榜单下限，无需补位。',
+    why: x.belowBarReason || x.pitch || x.thesis || '模型判为未达标；达标标的已满足榜单下限，无需补位。',
     keyData: x.keyData || null, suggestRemove: !!x.suggestRemove,
   };
 }
@@ -378,7 +381,7 @@ async function reviewOnce(profiles, { topN, minN, onEvent, preScreened = null, t
       // 分层数字：L1 提示词 + L2 工具返回同为白名单；L3（externalNotes）不参与校验，
       // 它本来就是「模型自己的知识」，拿实测白名单去校验它等于不许它质疑数据。
       const text = [
-        ...top.map((x) => `${x.thesis || ''} ${x.belowBarReason || ''} ${x.anchorWhy || ''} ${x.keyData || ''} ${(x.killCriteria || []).join(' ')} ${(x.risks || []).join(' ')}`),
+        ...top.map((x) => `${x.pitch || ''} ${x.thesis || ''} ${x.belowBarReason || ''} ${x.anchorWhy || ''} ${x.keyData || ''} ${(x.killCriteria || []).join(' ')} ${(x.risks || []).join(' ')}`),
         ...rejected.map((x) => `${x.why} ${x.keyData || ''}`),
       ].join(' ');
       const v = validateNumbers(text, whitelistOf(prompt + (tr ? '\n' + tr.text() : '')));
