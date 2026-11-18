@@ -187,8 +187,14 @@ export async function collect(market, { onProgress, onlyCodes = null } = {}) {
   const t0 = Date.now();
   const only = onlyCodes ? new Set(onlyCodes.map((c) => String(c).toUpperCase())) : null;
   const isOnly = (s) => !!only?.has(String(s.code || '').toUpperCase());
-  onProgress?.('拉取全市场列表', { unit: 'collect', key: 'universe' });
-  const universe = await em.universe(market);
+  // 自选池路径（v0.11.5）：按代码点名 ulist，不再拉全市场 clist。
+  // 此前为十来只票先拉 56 页 clist 再过滤——请求量差一个数量级，还撞上 clist 的
+  // 路径级频控（2026-10-03 实测：同主机 ulist 正常、clist 全灭，A股 universe 断供 5 天）。
+  onProgress?.(only ? `批量点名行情（自选 ${only.size} 只）` : '拉取全市场列表',
+    { unit: 'collect', key: only ? 'ulist' : 'universe' });
+  const universe = only
+    ? await em.quotesBySecids([...only], market)
+    : await em.universe(market);
   const pool = only ? universe.filter(isOnly) : universe.filter((s) => inPool(s, market));
 
   onProgress?.(`批量行情与 52 周高低（${pool.length} 只）`, { unit: 'collect', key: 'quotes' });
@@ -232,7 +238,7 @@ export async function collect(market, { onProgress, onlyCodes = null } = {}) {
   return {
     rows,
     meta: {
-      market, universe: universe.length, pool: pool.length, scope: only ? 'watch' : 'market',
+      market, universe: only ? null : universe.length, pool: pool.length, scope: only ? 'watch' : 'market',
       // 自选池挖掘：codes 是在 universe 里找到并已收集的自选代码（未找到的由调用方报出）
       watch: only ? { requested: only.size, codes: pool.map((s) => s.code) } : undefined,
       quoted: quotes.size, elapsedMs: Date.now() - t0,

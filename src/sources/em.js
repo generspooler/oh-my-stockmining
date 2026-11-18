@@ -1,7 +1,7 @@
 // 东方财富数据源：全市场列表 / 日K / A股逐日估值序列 / 三大报表（A股宽表、美股长表）。
 // 注意：clist 的 f2(最新价) 在美股缩放不一致（NVDA ÷1000、BRK.A ÷100），一律不使用，
 // 价格改由腾讯行情或估值序列/日K 提供。PE(f115)/PB(f23) 为 ×100，市值(f20)/成交额(f6) 为原值。
-import { fetchJson, cached, pool } from '../util.js';
+import { fetchJson, cached, pool, sleep } from '../util.js';
 import { CACHE_TTL, LIMITS } from '../config.js';
 
 const EM_HEADERS = { Referer: 'https://data.eastmoney.com/' };
@@ -27,7 +27,9 @@ async function push(path, host0) {
   // 几个域名共用同一套解析与线路，一个不通往往个个不通（IPv6 断连那次就是）。
   // 报错时把「全部失败」说清楚，别让调用方以为只是最后那台挂了。
   throw Object.assign(
-    new Error(`东财行情 ${hosts.length} 个域名均失败 · 最后一次：${lastErr?.message || '空响应'}`),
+    new Error(`东财行情 ${hosts.length} 个域名均失败 · 最后一次：${lastErr?.message || '空响应'}`
+      + `（疑似触发东财频控：该 IP 的行情接口被临时封锁，通常数十分钟至数小时后自动恢复；`
+      + `自选池分析走 ulist 点名不受影响）`),
     { cause: lastErr },
   );
 }
@@ -70,10 +72,18 @@ const UNIVERSE_FIELDS = 'f12,f13,f14,f6,f9,f20,f21,f23,f26,f100,f115,f3,f24,f25,
 // 6 小时内会持续读到按旧字段解析的结果，新字段静默全为 null。
 // 与 MAINFINADATA 的 MAP_VERSION 同理（那次踩坑见下方注释）。
 const UNIVERSE_VERSION = 'v2-f133';
+// clist 对本机 IP 有路径级频控（v0.11.5）：一轮 56~139 页并发拉取会把 IP 顶过阈值，
+// 之后连第 1 页都拿不到（2026-10-03 实测）。全市场路径翻页降到并发 2 + 页间 300ms，
+// 一轮约多花 20~40s，换频控安全边际；自选池路径已改走 ulist 点名（quotesBySecids），
+// 不再依赖 clist。
+const CLIST_CONCURRENCY = 2;
+const CLIST_PAGE_GAP_MS = 300;
 
 export async function universe(market, { includeBeijing = false } = {}) {
   const fs = market === 'us' ? US_BOARDS : includeBeijing ? `${CN_BOARDS},${CN_BJ}` : CN_BOARDS;
-  return cached(`universe:${UNIVERSE_VERSION}:${market}:${fs}`, CACHE_TTL.universe, async () => {
+  // staleFallback：clist 被频控/断连时回退过期缓存（标注 _staleAt）。全市场清单 6 小时 TTL，
+  // 过期几小时的旧清单对联想/同业横截面仍然够用；没有清单才是真正不可用。
+  const out = await cached(`universe:${UNIVERSE_VERSION}:${market}:${fs}`, CACHE_TTL.universe, async () => {
     const first = await push(`/api/qt/clist/get?${qs({
       pn: 1, pz: 100, po: 1, np: 1, fid: 'f20', fs,
       fields: UNIVERSE_FIELDS,
@@ -89,10 +99,11 @@ export async function universe(market, { includeBeijing = false } = {}) {
     // 粗筛少一批票也没人知道。现在失败页串行再试一轮，仍失败就整体报错并说明第几页：
     // 与 cached()「失败结果不写盘」同一原则，残缺清单比没有清单更害人。
     const pns = Array.from({ length: Math.max(0, pages - 1) }, (_, i) => i + 2);
-    const rest = await pool(pns, LIMITS.emConcurrency, page);   // pool 把失败项记为 null，空页是 []
+    const rest = await pool(pns, CLIST_CONCURRENCY, page);   // pool 把失败项记为 null，空页是 []
     let lastErr = null;
     for (const pn of pns) {
       if (rest[pn - 2] != null) continue;
+      if (CLIST_PAGE_GAP_MS > 0) await sleep(CLIST_PAGE_GAP_MS);   // 重试轮也保持节流
       try { rest[pn - 2] = await page(pn); } catch (e) { lastErr = e; }
     }
     const failed = pns.filter((pn) => rest[pn - 2] == null);
@@ -125,7 +136,10 @@ export async function universe(market, { includeBeijing = false } = {}) {
       dividendYield: n(r.f133),
       secid: market === 'us' ? usSecid(r.f12, n(r.f13) || 105) : cnSecid(r.f12),
     }));
-  });
+  }, { staleFallback: true });
+  // 过期回退的清单打上标记，调用方（渲染/提示词）可提示「数据为 X 时点」
+  if (out?._staleAt) console.warn(`[universe] ${market} 清单为 ${out._staleAt} 的过期缓存（clist 拉取失败已回退）`);
+  return out;
 }
 
 /**
@@ -151,6 +165,70 @@ export async function kline(secid, { klt = 101, fqt = 1, beg = '20180101', end =
       const [date, close, turnover] = line.split(',');
       return { date, close: n(close), turnover: n(turnover) };
     });
+  });
+}
+
+// ── ulist.np：按 secids 点名批量行情（v0.11.5）──────────────────────
+// 背景：clist（全市场列表）对本机 IP 有路径级频控——2026-10-03 实测同主机 ulist/kline
+// 正常 200、唯独 clist 连 1 页都拿不到（TCP/TLS 均建立，请求一发出即被服务端断开）。
+// 自选池分析只有十来只票，此前却要先拉全市场 56 页 clist 再过滤，既触发频控又脆弱。
+// ulist.np 一次点名最多试过 20+ 只、返回与 clist 完全相同的字段全集，请求量 56 页 → 1 次。
+//
+// 关键差异：ulist 带 fltt=2 时比率字段是**原值**（f115=19.32 即 PE 19.32），
+// 而 clist 不带 fltt 是 ×100（f115=774 即 PE 7.74）。两者映射必须分开，缩放不可混用。
+// A股 code→secid 规则固定（cnSecid）；美股市场号 105/106/107 无法从 code 推出，
+// 三个都发过去、存活那个就是真身（实测 106.AAPL 静默丢弃、105.AAPL 返回）。
+
+/** 把 ulist 的 fltt=2 行映射成与 universe() 同构的对象（缩放口径：原值）。 */
+function mapUlistRow(r, market) {
+  return {
+    code: r.f12,
+    name: r.f14,
+    mk: n(r.f13),
+    market,
+    marketCap: n(r.f20),
+    floatCap: n(r.f21),
+    turnover: n(r.f6),
+    pe: n(r.f115),        // fltt=2 下已是原值，不再 ÷100
+    peDyn: n(r.f9),
+    pb: n(r.f23),
+    industry: r.f100 || null,
+    listDate: r.f26 ? String(r.f26) : null,
+    chgToday: n(r.f3),
+    chg60d: n(r.f24),
+    chgYtd: n(r.f25),
+    roe: n(r.f37),
+    shares: n(r.f38),
+    dividendYield: n(r.f133),
+    secid: market === 'us' ? usSecid(r.f12, n(r.f13) || 105) : cnSecid(r.f12),
+  };
+}
+
+/**
+ * 按代码点名批量行情（自选池收集专用）。返回与 universe() 行同构的对象数组，
+ * 找不到的代码不在结果里（调用方据此报「未找到」）。缓存 15 分钟与行情同级。
+ */
+export async function quotesBySecids(codes, market) {
+  if (!codes?.length) return [];
+  const uniq = [...new Set(codes.map((c) => String(c).toUpperCase()))];
+  return cached(`ulist:v1:${market}:${uniq.slice().sort().join(',')}`, CACHE_TTL.quote, async () => {
+    // A股 secid 可由规则直接推出；美股 105/106/107 全发，靠服务端静默丢弃错误市场号
+    const secids = market === 'us'
+      ? uniq.flatMap((c) => ['105', '106', '107'].map((mk) => `${mk}.${c}`))
+      : uniq.map((c) => cnSecid(c));
+    const out = [];
+    // ulist 单次点名 60 只以内实测稳定；池子再大就分批
+    for (let i = 0; i < secids.length; i += 60) {
+      const d = await push(`/api/qt/ulist.np/get?${qs({
+        fltt: 2, invt: 2, secids: secids.slice(i, i + 60).join(','),
+        fields: UNIVERSE_FIELDS,
+      })}`);
+      out.push(...(d?.data?.diff || []));
+    }
+    const byCode = new Map();
+    for (const r of out) if (r?.f12 && !byCode.has(r.f12)) byCode.set(r.f12, mapUlistRow(r, market));
+    // ulist 不带 fs 过滤，ETF/退市代码点名也会返回——与 universe 同样按风险名标记，由 inPool 判定
+    return uniq.map((c) => byCode.get(c)).filter(Boolean);
   });
 }
 

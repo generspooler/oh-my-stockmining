@@ -31,16 +31,42 @@ const sha = (s) => crypto.createHash('sha1').update(s).digest('hex').slice(0, 20
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 export const hash = (obj) => crypto.createHash('sha256').update(typeof obj === 'string' ? obj : JSON.stringify(obj)).digest('hex').slice(0, 16);
 
-/** 读磁盘缓存；未命中或过期则跑 producer 并写回。ttlMs<=0 表示不缓存。 */
-export async function cached(key, ttlMs, producer) {
+/**
+ * 读磁盘缓存；未命中或过期则跑 producer 并写回。ttlMs<=0 表示不缓存。
+ * staleFallback: producer 抛错时回退到已过期的缓存（标注 _staleAt 数据时点），
+ * 比空手而归强——一份过期几小时的清单足够自选池/联想用，残缺或不存在的清单才害人。
+ * 「失败结果不写盘」的原则不变：回退不写盘，过期值原样返回。
+ */
+export async function cached(key, ttlMs, producer, { staleFallback = false } = {}) {
   const file = path.join(CACHE_DIR, `${sha(key)}.json`);
+  const readStale = () => {
+    try {
+      const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (raw.v != null && !(Array.isArray(raw.v) && raw.v.length === 0)) {
+        return Object.assign(Array.isArray(raw.v) ? [] : {}, raw.v, { _staleAt: new Date(raw.t).toISOString() });
+      }
+    } catch {}
+    return null;
+  };
   if (ttlMs > 0) {
     try {
       const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
       if (Date.now() - raw.t < ttlMs) return raw.v;
     } catch {}
   }
-  const v = await producer();
+  let v;
+  try {
+    v = await producer();
+  } catch (e) {
+    if (staleFallback) {
+      const stale = readStale();
+      if (stale != null) {
+        console.warn(`[cache] ${key} 拉取失败，回退过期缓存（${new Date(stale._staleAt).toLocaleString()}）：${e.message}`);
+        return stale;
+      }
+    }
+    throw e;
+  }
   // 失败结果（null / 空数组）不写盘，否则一次网络抖动会毒化缓存整个 TTL
   const worthCaching = v != null && !(Array.isArray(v) && v.length === 0);
   if (ttlMs > 0 && worthCaching) {
